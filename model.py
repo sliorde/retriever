@@ -10,38 +10,59 @@
 from math import sqrt
 from functools import lru_cache, partial
 import torch
-from torch import Tensor, nn
-from torch.nn.functional import pad
-from torch.nn import Parameter, Module, ModuleList, Linear, Embedding, Sequential, GELU, Dropout
+import torch.nn as nn
+from torch.nn.functional import pad, softmax
 import opt_einsum
 
 
-def view_or_reshape(x, *shape):
-    if isinstance(shape[0], Tensor):
-        shape = shape[0].shape
+def view_or_reshape(x, *tensor_or_shape):
+    """
+    change the view of tensor x to the specified shape or to the specified tensor's shape; if impossible, reshape
+    (`reshape` incurs a copy whereas `view` does not)
+    """
+    if isinstance(tensor_or_shape[0], torch.Tensor):
+        shape = tensor_or_shape[0].shape
+    else:
+        shape = tensor_or_shape
     try:
         x = x.view(shape)
     except RuntimeError:
-        x = x.reshape(shape)
+        x = x.reshape(shape) 
     return x
 
 
 def chunkenize(x, chunk_size, dim=0):
+    """
+    given a tensor with a sequence dimension, reshape this dimension to two dimensions:
+    one for indexing the chunk and one for indexing position within a chunk.
+    `dim` is the sequence dimension.
+    For example, if `x` is a tensor with shape`[24,1,2,3,4,5]` representing a sequence of length 24 and we use `
+    `dim=0` and `chunk_size=4`, we will get a tensor with shape `[4,6,1,2,3,4,5]`, where the `6` is in the chunk
+    index dimension, and `4` is in the within-chunk dimension.
+    TODO: maybe we should change the ordering of dimensions of all objects so that we don't need to do transpose
+     here. The transpose operation incurs a copy later.
+    """
     dim = dim % x.ndim
     return view_or_reshape(x, *x.shape[:dim], -1, chunk_size, *x.shape[(dim + 1):]).transpose(dim, dim + 1)
 
 
 def unchunk(x, dim=0):
+    """
+    the inverse of `chunk()`
+    """
     return view_or_reshape(x.transpose(dim, dim + 1), *x.shape[:dim], -1, *x.shape[(dim + 2):])
 
 
-@lru_cache
-def cached_path(subscripts, *shapes):
+@lru_cache(128)
+def cached_einsum_path(subscripts, *shapes):
+    """
+    we use an einsum function that optimizes the reduction order of indices in a tensor   
+    """
     return opt_einsum.contract_expression(subscripts, *shapes)
 
 
 def einsum(subscripts, *operands):
-    path = cached_path(subscripts, *[tuple(o.shape) for o in operands])
+    path = cached_einsum_path(subscripts, *[tuple(o.shape) for o in operands])
     return path(*operands)
 
 
@@ -72,22 +93,22 @@ def attention(x_q, x_kv, to_q, to_k, to_v, to_out, mask=None, positional_encodin
     if flatten_dims is not None:
         logits = view_or_reshape(logits, logits.size(0), -1, *logits.shape[flatten_dims + 1:])
         x_kv = view_or_reshape(x_kv, -1, *x_kv.shape[flatten_dims:])
-    weights = nn.functional.softmax(logits, 1)
+    weights = softmax(logits, 1)
     if dropout is not None:
         weights = dropout(weights)
     out = einsum('dch,chb,m...b,nm...h->n...d', to_out, to_v, x_kv, weights)
     return out
 
 
-class RMSNorm(Module):
+class RMSNorm(nn.Module):
     def __init__(self, d, eps=1e-8, device=None, dtype=None):
         factory_kwargs = {'device': device, 'dtype': dtype}
-        Module.__init__(self)
+        nn.Module.__init__(self)
 
         self.eps = eps
         self.dim_norm = d ** (-1. / 2)
 
-        self.scale = Parameter(torch.ones(d, **factory_kwargs))
+        self.scale = nn.Parameter(torch.ones(d, **factory_kwargs))
 
     def forward(self, x):
         rms = x.norm(2, dim=-1, keepdim=True) * self.dim_norm
@@ -96,10 +117,10 @@ class RMSNorm(Module):
         return scaled
 
 
-class Attention(Module):
+class Attention(nn.Module):
     def __init__(self, d, d_x_q=None, d_x_kv=None, d_qk=None, d_v=None, num_heads=1, causal=False, offset=0,
                  flatten_dims=None, dropout=0.0):
-        Module.__init__(self)
+        nn.Module.__init__(self)
 
         assert d is not None
         if d_x_q is None:
@@ -114,13 +135,13 @@ class Attention(Module):
             assert d_v * num_heads == d
         d_out = d
 
-        self.to_q = Parameter(torch.randn(d_qk, num_heads, d_x_q))
-        self.to_k = Parameter(torch.randn(d_qk, num_heads, d_x_kv))
-        self.to_v = Parameter(torch.randn(d_v, num_heads, d_x_kv))
-        self.to_out = Parameter(torch.randn(d_out, d_v, num_heads))
-        self.for_pos_enc = Parameter(torch.randn(d_qk, num_heads, d_x_kv))
+        self.to_q = nn.Parameter(torch.randn(d_qk, num_heads, d_x_q))
+        self.to_k = nn.Parameter(torch.randn(d_qk, num_heads, d_x_kv))
+        self.to_v = nn.Parameter(torch.randn(d_v, num_heads, d_x_kv))
+        self.to_out = nn.Parameter(torch.randn(d_out, d_v, num_heads))
+        self.for_pos_enc = nn.Parameter(torch.randn(d_qk, num_heads, d_x_kv))
 
-        self.dropout = Dropout(dropout)
+        self.dropout = nn.Dropout(dropout)
 
         self.mask_cache = dict()
         self.pos_enc_cache = dict()
@@ -187,27 +208,27 @@ class Attention(Module):
                          self.dropout)
 
 
-class AttentionLayer(Module):
+class AttentionLayer(nn.Module):
     def __init__(self, d, d_kv=None, num_heads=1, causal=False, dropout=0.0):
-        Module.__init__(self)
+        nn.Module.__init__(self)
         if d_kv is None:
             d_kv = d
         self.norm = RMSNorm(d)
         self.attention = Attention(d, d_x_kv=d_kv, num_heads=num_heads, causal=causal, dropout=dropout)
-        self.dropout = Dropout(dropout)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x_q, x_kv=None):
         return x_q + self.dropout(self.attention(self.norm(x_q), x_kv))
 
 
-class ChunkedCrossAttentionLayer(Module):
+class ChunkedCrossAttentionLayer(nn.Module):
     def __init__(self, chunk_size, d, d_kv, num_heads=1, dropout=0.0):
-        Module.__init__(self)
+        nn.Module.__init__(self)
         if d_kv is None:
             d_kv = d
         self.norm = RMSNorm(d)
         self.attention = Attention(d, d_x_kv=d_kv, num_heads=num_heads, offset=chunk_size, flatten_dims=2)
-        self.dropout = Dropout(dropout)
+        self.dropout = nn.Dropout(dropout)
 
         self.chunk_size = chunk_size
 
@@ -221,16 +242,16 @@ class ChunkedCrossAttentionLayer(Module):
         return x_q + self.dropout(z)
 
 
-class FeedForwardLayer(Module):
+class FeedForwardLayer(nn.Module):
     def __init__(self, d, d_ff, dropout=0.0):
-        Module.__init__(self)
-        self.ff = Sequential(
+        nn.Module.__init__(self)
+        self.ff = nn.Sequential(
             RMSNorm(d),
-            Linear(d, d_ff),
-            GELU(),
-            Dropout(dropout),
-            Linear(d_ff, d),
-            Dropout(dropout)
+            nn.Linear(d, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d),
+            nn.Dropout(dropout)
         )
 
     def forward(self, x):
@@ -263,12 +284,12 @@ class Retriever:
              self.chunk_size + self.continuation_length, self.num_neighbors,
              *seq_chunked.shape[2:]),
             device=seq.device,
-            generator=torch.Generator().manual_seed(29847892371)
+            generator=torch.Generator(device=seq.device).manual_seed(29847892371)
         )
         return retrieved.movedim(0, 2)
 
 
-class Encoder(Module):
+class Encoder(nn.Module):
     def __init__(
             self,
             num_layers,
@@ -280,15 +301,15 @@ class Encoder(Module):
             chunk_size,
             dropout=0.0
     ):
-        Module.__init__(self)
+        nn.Module.__init__(self)
 
-        self.dropout = Dropout(dropout)
+        self.dropout = nn.Dropout(dropout)
 
-        self.sa = ModuleList([AttentionLayer(d, num_heads=num_heads, dropout=dropout) for _ in range(num_layers)])
-        self.ca = ModuleList(
+        self.sa = nn.ModuleList([AttentionLayer(d, num_heads=num_heads, dropout=dropout) for _ in range(num_layers)])
+        self.ca = nn.ModuleList(
             [AttentionLayer(d, d_dec, num_heads=num_heads, dropout=dropout) if i in ca_layers else None for i in
              range(num_layers)])
-        self.ff = ModuleList([FeedForwardLayer(d, d_ff, dropout=dropout) for _ in range(num_layers)])
+        self.ff = nn.ModuleList([FeedForwardLayer(d, d_ff, dropout=dropout) for _ in range(num_layers)])
         self.norm = RMSNorm(d)
 
         self.chunk_size = chunk_size
@@ -307,7 +328,7 @@ class Encoder(Module):
         return self.norm(y)
 
 
-class Decoder(Module):
+class Decoder(nn.Module):
     def __init__(
             self,
             num_layers,
@@ -320,21 +341,21 @@ class Decoder(Module):
             chunk_size,
             encoder,
             dropout=0.0):
-        Module.__init__(self)
+        nn.Module.__init__(self)
 
         self.encoder = encoder
-        self.dropout = Dropout(dropout)
+        self.dropout = nn.Dropout(dropout)
 
         def use_cross(i):
             return (i >= ca_start) and ((i - ca_start) % ca_freq == 0)
 
-        self.sa = ModuleList(
+        self.sa = nn.ModuleList(
             [AttentionLayer(d, num_heads=num_heads, causal=True, dropout=dropout) for _ in range(num_layers)])
-        self.ca = ModuleList(
+        self.ca = nn.ModuleList(
             [ChunkedCrossAttentionLayer(chunk_size, d, d_enc, num_heads=num_heads, dropout=dropout)
              if use_cross(i) else None
              for i in range(num_layers)])
-        self.ff = ModuleList([FeedForwardLayer(d, d_ff, dropout=dropout) for _ in range(num_layers)])
+        self.ff = nn.ModuleList([FeedForwardLayer(d, d_ff, dropout=dropout) for _ in range(num_layers)])
         self.norm = RMSNorm(d)
 
         self.chunk_size = chunk_size
@@ -353,7 +374,7 @@ class Decoder(Module):
         return self.norm(x)
 
 
-class RetroLanguageModel(Module):
+class RetroLanguageModel(nn.Module):
     def __init__(
             self,
             vocab_size,
@@ -373,18 +394,18 @@ class RetroLanguageModel(Module):
             num_neighbors,
             dropout,
     ):
-        Module.__init__(self)
+        nn.Module.__init__(self)
         self.retriever = Retriever(vocab_size, chunk_size, continuation_length, num_neighbors)
-        self.embedding_enc = Embedding(vocab_size, d_enc)
-        self.embedding_dec = Embedding(vocab_size, d_dec)
+        self.embedding_enc = nn.Embedding(vocab_size, d_enc)
+        self.embedding_dec = nn.Embedding(vocab_size, d_dec)
         self.encoder = Encoder(num_layers_enc, d_enc, d_ff_enc, d_dec, num_heads_enc, ca_layers, chunk_size,
                                dropout)
         encoder = partial(self.encoder)
         self.decoder = Decoder(num_layers_dec, d_dec, d_ff_dec, d_enc, num_heads_dec, ca_start_dec, ca_freq_dec,
                                chunk_size,
                                encoder, dropout)
-        self.to_vocab = Linear(d_dec, vocab_size)
-        self.dropout = Dropout(dropout)
+        self.to_vocab = nn.Linear(d_dec, vocab_size)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, seq):
         retrieved = self.retriever.retrieve(seq)  # [C', N, L//C, B]   in paper: =RET(C)
