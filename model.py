@@ -10,7 +10,7 @@ from itertools import chain
 
 import torch
 import torch.nn as nn
-from torch.nn.functional import pad, softmax
+from torch.nn.functional import pad, softmax, cross_entropy
 import opt_einsum
 
 
@@ -452,13 +452,20 @@ class RetroLanguageModel(nn.Module):
             for module in subnet.for_init:
                 module.to_out.data /= sqrt(len(subnet.for_init))
 
-    def forward(self, seq):
+    def forward(self, seq, labels=None):
         retrieved = self.retriever.retrieve(seq)  # [C', N, L//C, B]   in paper: =RET(C)
 
         x = self.dropout(self.embedding_dec(seq))  # [L, B, D]  in paper: =H
         y = self.dropout(self.embedding_enc(retrieved))  # [C', N, (L//C), B, D]
 
-        return self.to_vocab(self.decoder(x, y))
+        logits = self.to_vocab(self.decoder(x, y))
+
+        if labels is not None:
+            loss = cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
+            return logits, loss
+
+        else:
+            return logits
 
 
 if __name__ == '__main__':
