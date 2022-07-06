@@ -154,12 +154,12 @@ class Attention(nn.Module):
         self.causal = causal
         self.flatten_dims = flatten_dims
 
-    def get_causal_mask(self, l, device):
-        if l in self.mask_cache:
-            mask = self.mask_cache[l].to(device)
+    def get_causal_mask(self, sz, device):
+        if sz in self.mask_cache:
+            mask = self.mask_cache[sz].to(device)
         else:
-            mask = torch.ones(l, l, device=device, dtype=torch.bool).triu(1)
-            self.mask_cache[l] = mask
+            mask = torch.ones(sz, sz, device=device, dtype=torch.bool).triu(1)
+            self.mask_cache[sz] = mask
             if len(self.mask_cache) > 10:
                 self.mask_cache.pop(next(iter(self.mask_cache)))
         return mask
@@ -194,11 +194,11 @@ class Attention(nn.Module):
     def forward(self, x_q, x_kv=None):
         if x_kv is None:
             x_kv = x_q
-        l = x_q.size(0)
+        sz = x_q.size(0)
         device = x_q.device
         if self.causal:
             assert x_kv is x_q
-            mask = self.get_causal_mask(l, device)
+            mask = self.get_causal_mask(sz, device)
         else:
             mask = None
         pos_enc = self.get_pos_enc(x_q.size(0), x_kv.size(0), self.offset, device)
@@ -429,10 +429,10 @@ class RetroLanguageModel(nn.Module):
 
         def init(module):
             if isinstance(module, RMSNorm):
-                assert len(list(module.parameters())) == 1 # scale
+                assert len(list(module.parameters())) == 1  # scale
                 nn.init.constant_(module.scale, 1.0)
             elif isinstance(module, Attention):
-                assert len(list(module.parameters())) == 5 # to_q, to_k, to_v, to_out, for_pos_enc
+                assert len(list(module.parameters())) == 5  # to_q, to_k, to_v, to_out, for_pos_enc
                 for p in module.parameters():
                     xavier_(p)
             elif isinstance(module, nn.Linear):
