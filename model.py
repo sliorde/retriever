@@ -1,14 +1,13 @@
 # TODO:
-#  * weight initialization
 #  * retrieval preprocessing+lookup
 #  * make transformer model more flexible so that it's easy to retrofit different given models
 #  * cached inference
 #  * share caches of masks and position encoding between different layers
 #  * training loop, parallelization
-
-
 from math import sqrt
 from functools import lru_cache, partial
+from itertools import chain
+
 import torch
 import torch.nn as nn
 from torch.nn.functional import pad, softmax
@@ -217,6 +216,9 @@ class AttentionLayer(nn.Module):
         self.attention = Attention(d, d_x_kv=d_kv, num_heads=num_heads, causal=causal, dropout=dropout)
         self.dropout = nn.Dropout(dropout)
 
+        # we need this for initialization:
+        self.to_out = self.attention.to_out
+
     def forward(self, x_q, x_kv=None):
         return x_q + self.dropout(self.attention(self.norm(x_q), x_kv))
 
@@ -231,6 +233,9 @@ class ChunkedCrossAttentionLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         self.chunk_size = chunk_size
+
+        # we need this for initialization:
+        self.to_out = self.attention.to_out
 
     def forward(self, x_q, x_kv):
         x_q_chunked = chunkenize(
@@ -253,6 +258,9 @@ class FeedForwardLayer(nn.Module):
             nn.Linear(d_ff, d),
             nn.Dropout(dropout)
         )
+
+        # we need this for initialization:
+        self.to_out = [m for m in self.ff.modules() if isinstance(m, nn.Linear)][-1].weight
 
     def forward(self, x):
         return x + self.ff(x)
@@ -314,6 +322,9 @@ class Encoder(nn.Module):
 
         self.chunk_size = chunk_size
 
+        # we will use this for initializing the final projection of each attention/ff layer
+        self.for_init = [m for m in chain(self.sa, self.ca, self.ff) if m is not None]
+
     def forward(self, y, x):  # in paper: retrieved->RET(C),  y->H
         """
         y: [L, B, D]
@@ -359,6 +370,9 @@ class Decoder(nn.Module):
         self.norm = RMSNorm(d)
 
         self.chunk_size = chunk_size
+
+        # we will use this for initializing the final projection of each attention/ff layer
+        self.for_init = [m for m in chain(self.sa, self.ca, self.ff) if m is not None]
 
     def forward(self, x, y):
         encoder_invoked = False
@@ -406,6 +420,37 @@ class RetroLanguageModel(nn.Module):
                                encoder, dropout)
         self.to_vocab = nn.Linear(d_dec, vocab_size)
         self.dropout = nn.Dropout(dropout)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        def xavier_(p):
+            nn.init.xavier_normal_(p.view(-1, p.size(-1)), 1.0)
+
+        def init(module):
+            if isinstance(module, RMSNorm):
+                assert len(list(module.parameters())) == 1 # scale
+                nn.init.constant_(module.scale, 1.0)
+            elif isinstance(module, Attention):
+                assert len(list(module.parameters())) == 5 # to_q, to_k, to_v, to_out, for_pos_enc
+                for p in module.parameters():
+                    xavier_(p)
+            elif isinstance(module, nn.Linear):
+                assert len(list(module.parameters())) == 2  # weight, bias
+                xavier_(module.weight)
+                nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.Embedding):
+                assert len(list(module.parameters())) == 1  # weight
+                xavier_(module.weight)
+
+        self.apply(init)
+
+        # from GPT2 paper::
+        #   > A modified initialization which accounts for the accumulation on the residual path with model depth. Scale
+        #   > the weights of residual layers at initialization by a factor of 1/√N where N is the # of residual layers.
+        for subnet in [self.decoder, self.encoder]:
+            for module in subnet.for_init:
+                module.to_out.data /= sqrt(len(subnet.for_init))
 
     def forward(self, seq):
         retrieved = self.retriever.retrieve(seq)  # [C', N, L//C, B]   in paper: =RET(C)
