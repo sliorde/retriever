@@ -1,8 +1,8 @@
 # TODO:
 #  * retrieval preprocessing+lookup
 #  * make transformer model more flexible so that it's easy to retrofit different given models
-#  * cached inference
-#  * share caches of masks and position encoding between different layers
+#  * cached inference (i.e forward pass for a new token does not need to repeat computations
+#   from previous tokens)
 #  * training loop, parallelization
 from math import sqrt
 from functools import lru_cache, partial
@@ -52,7 +52,7 @@ def unchunk(x, dim=0):
     return view_or_reshape(x.transpose(dim, dim + 1), *x.shape[:dim], -1, *x.shape[(dim + 2):])
 
 
-@lru_cache(128)
+@lru_cache(50)
 def cached_einsum_path(subscripts, *shapes):
     """
     we use an einsum function that optimizes the reduction order of indices in a tensor   
@@ -117,6 +117,10 @@ class RMSNorm(nn.Module):
 
 
 class Attention(nn.Module):
+
+    sincos_cache = dict()
+    mask_cache = dict()
+
     def __init__(self, d, d_x_q=None, d_x_kv=None, d_qk=None, d_v=None, num_heads=1, causal=False, offset=0,
                  flatten_dims=None, dropout=0.0):
         nn.Module.__init__(self)
@@ -142,9 +146,6 @@ class Attention(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-        self.mask_cache = dict()
-        self.pos_enc_cache = dict()
-
         self.d_x_q = d_x_q
         self.d_x_kv = d_x_kv
         self.d_qk = d_qk
@@ -160,20 +161,21 @@ class Attention(nn.Module):
         else:
             mask = torch.ones(sz, sz, device=device, dtype=torch.bool).triu(1)
             self.mask_cache[sz] = mask
-            if len(self.mask_cache) > 10:
+            if len(self.mask_cache) > 50:
                 self.mask_cache.pop(next(iter(self.mask_cache)))
         return mask
 
     def get_pos_enc(self, sz_q, sz_k, offset, device):
-        # TODO: for training, we cache the position encoding before applying the linear transform,
-        #  because the transform is trainable and changes between batches...but for eval, we might
-        #  as well cache the result of the transform.
+        # TODO: for training, we cache the position encoding before applying the linear transform, because the transform
+        #  is trainable and changes between batches...but for eval, we might as well cache the result of the transform.
+        #  However, we need to be careful about this, since what if we put model on eval mode
+        #  temporarily, or we modify the model's weights while in eval?
         #
-        # TODO: we use relative encoding of TransformerXL, but without the bias terms. This is what
-        #  I think is implied by the retro paper, but it's not defined explicitly.
-        key = (sz_q, sz_k, offset)
-        if key in self.pos_enc_cache:
-            sincos, dists = self.pos_enc_cache[key]
+        # TODO: we use relative encoding of TransformerXL, but without the bias terms. This is what I think is implied
+        #  by the retro paper, but it's not defined explicitly.
+        key = (sz_q, sz_k, offset, self.d_x_kv)
+        if key in self.sincos_cache:
+            sincos, dists = self.sincos_cache[key]
             sincos = sincos.to(device)
             dists = dists.to(device)
         else:
@@ -184,9 +186,9 @@ class Attention(nn.Module):
             phases = r[:, None] * (inv_freq[None, :])  # [sz_q+sz_k-1, d_x_kv/2]
             sincos = torch.cat([phases.sin(), phases.cos()], dim=-1)  # [sz_q+sz_k-1, d_x_kv]
 
-            self.pos_enc_cache[key] = (sincos, dists)
-            if len(self.pos_enc_cache) > 10:
-                self.pos_enc_cache.pop(next(iter(self.pos_enc_cache)))
+            self.sincos_cache[key] = (sincos, dists)
+            if len(self.sincos_cache) > 50:
+                self.sincos_cache.pop(next(iter(self.sincos_cache)))
         pos_enc = einsum('dhb,nb->ndh', self.for_pos_enc, self.dropout(sincos))  # [sz_q+sz_k-1, d_qk, h]
         pos_enc = pos_enc[dists - dists.min()]  # [sz_q, sz_k, d_qk, h]
         return pos_enc
