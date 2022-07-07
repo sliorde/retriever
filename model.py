@@ -468,38 +468,3 @@ class RetroLanguageModel(nn.Module):
 
         else:
             return logits
-
-
-if __name__ == '__main__':
-
-    torch.set_printoptions(precision=3, threshold=1000, linewidth=1000000)
-
-    vocab_size = 1000
-    seq_length = 24  # in paper: =n=2048
-    batch_size = 3
-
-    seq = torch.randint(vocab_size, (seq_length, batch_size))  # [L, B]  in paper: =X,
-
-    model = RetroLanguageModel(
-        vocab_size,
-        d_dec=16,
-        d_ff_dec=32,
-        num_heads_dec=2,
-        num_layers_dec=10,  # in paper: =L
-        ca_start_dec=5,  # in paper: =P[0]=6  (paper is 1-based, not zero-based)
-        ca_freq_dec=3,  # in paper: implied by P: "The retrieval models contain one Retro-block every 3 blocks,
-        d_enc=8,  # in paper: =d'
-        d_ff_enc=16,
-        num_heads_enc=2,
-        num_layers_enc=2,  # in paper: =Lenc=2
-        ca_layers={1},  # in paper: =P_enc={1}
-        chunk_size=4,  # in paper: =m=64  (this also equals the neighbor chunk size)
-        continuation_length=4,  # in paper: =64
-        num_neighbors=2,  # in paper: =k
-        dropout=0.1,
-    ).eval()
-
-    out = model.forward(seq)
-
-    print(seq.shape, flush=True)
-    print(out.shape, flush=True)
