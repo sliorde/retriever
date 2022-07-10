@@ -519,7 +519,7 @@ class Retriever:
         temporary dummy function that maintains causality
         """
         # seq [L, ...]
-        seq_chunked = chunkenize(seq, self.chunk_size)  # [C, L//C, ...]   #in paper: =C
+        seq_chunked = chunkenize(seq, self.chunk_size)  # [C, L//C, ...]
 
         retrieved = torch.randint(
             self.vocab_size,
@@ -570,13 +570,13 @@ class Encoder(nn.Module):
         # attention/ff layer
         self.for_init = [m for m in chain(self.sa, self.ca, self.ff) if m is not None]
 
-    def forward(self, y, x):  # in paper: retrieved->RET(C),  y->H
+    def forward(self, y, x):
         """
         y: [C', N, L//C, ..., D']
         x: [L, ..., D]
         """
         x = chunkenize(x, self.chunk_size)  # [C, L//C, ..., D]
-        for sa, ca, ff in zip(self.sa, self.ca, self.ff):  # in paper: i->p'
+        for sa, ca, ff in zip(self.sa, self.ca, self.ff):
             y = sa(y)  # [C', N, L//C, ..., D']
             if ca is not None:
                 y = ca(y, x)  # [C', N, L//C, ..., D']
@@ -636,7 +636,7 @@ class Decoder(nn.Module):
             x = sa(x)  # [L, ..., D]
             if ca is not None:
                 if z is None:
-                    z = self.encoder(y, x)  # [C', N, L//C, B, D']  in paper: =E
+                    z = self.encoder(y, x)  # [C', N, L//C, B, D']
                 x = ca(x, z)  # [L, ..., D]
             x = ff(x)  # [L, ..., D]
         return self.norm(x)  # [L, ..., D]
@@ -730,10 +730,10 @@ class RetroLanguageModel(nn.Module):
     def forward(self, seq, labels=None):
 
         # retrieve neighbors from database, for each chunk in `seq`
-        retrieved = self.retriever.retrieve(seq)  # [C', N, L//C, ...]   in paper: =RET(C)
+        retrieved = self.retriever.retrieve(seq)  # [C', N, L//C, ...]
 
         # convert tokens to embeddings
-        x = self.dropout(self.embedding_dec(seq))  # [L, ..., D]  in paper: =H
+        x = self.dropout(self.embedding_dec(seq))  # [L, ..., D]
         y = self.dropout(self.embedding_enc(retrieved))  # [C', N, L//C, ..., D']
 
         # apply decoder and language model head
