@@ -84,6 +84,13 @@ import torch.nn as nn
 from torch.nn.functional import pad, softmax, cross_entropy
 
 
+def have(x):
+    return x is not None
+
+def dont_have(x):
+    return not have(x)
+
+
 def chunkenize(x, chunk_size):
     """
     given a tensor with a sequence dimension, reshape this dimension to two dimensions:
@@ -138,7 +145,7 @@ def attention(q, k, v, mask=None, positional_encoding=None, additional_dim=None,
 
     content_logits = torch.einsum('n...hd,m...hd->nm...h', q, k)
 
-    if positional_encoding is None:
+    if dont_have(positional_encoding):
         position_logits = 0.0
     else:
         # as explained elsewhere in this source code, we use the relative positional
@@ -154,7 +161,7 @@ def attention(q, k, v, mask=None, positional_encoding=None, additional_dim=None,
 
         # this is required for the case of chunked-cross attention, where content logit contain
         # an additional neighbor dimension
-        if additional_dim is not None:
+        if have(additional_dim):
             position_logits.unsqueeze_(additional_dim)
 
     logits = content_logits + position_logits
@@ -165,11 +172,11 @@ def attention(q, k, v, mask=None, positional_encoding=None, additional_dim=None,
         # listing 1, it does not appear.
         logits /= sqrt(q.size(-1))
 
-    if mask is not None:
+    if have(mask):
         logits.masked_fill_(mask[(slice(None), slice(None), *(None,) * (logits.ndim - 2))],
                             float('-inf'))
 
-    if additional_dim is not None:
+    if have(additional_dim):
         # this is required for the case of chunked-cross attention, where logit vectors
         # from different neighbors are concatenated before applying softmax
         logits = logits.flatten(additional_dim-1, additional_dim)
@@ -177,7 +184,7 @@ def attention(q, k, v, mask=None, positional_encoding=None, additional_dim=None,
 
     weights = softmax(logits, 1)
 
-    if dropout is not None:
+    if have(dropout):
         weights = dropout(weights)
 
     return torch.einsum('nm...h,m...hd->n...hd', weights, v)
@@ -234,15 +241,15 @@ class Attention(nn.Module):
         """
         nn.Module.__init__(self)
 
-        assert d is not None
-        if d_x_q is None:
+        assert have(d)
+        if dont_have(d_x_q):
             d_x_q = d
-        if d_x_kv is None:
+        if dont_have(d_x_kv):
             d_x_kv = d
-        if d_qk is None:
+        if dont_have(d_qk):
             d_qk = d // num_heads
             assert d_qk * num_heads == d
-        if d_v is None:
+        if dont_have(d_v):
             d_v = d // num_heads
             assert d_v * num_heads == d
         d_out = d
@@ -340,7 +347,7 @@ class Attention(nn.Module):
         # x_q: [L, ..., D]
         # x_kv: [L', ..., D']
 
-        if x_kv is None:
+        if dont_have(x_kv):
             x_kv = x_q
 
         n, m = x_q.size(0), x_kv.size(0)
@@ -371,7 +378,7 @@ class AttentionBlock(nn.Module):
     """
     def __init__(self, d, d_kv=None, num_heads=1, causal=False, dropout=0.0):
         nn.Module.__init__(self)
-        if d_kv is None:
+        if dont_have(d_kv):
             d_kv = d
         self.norm = RMSNorm(d)
         self.attention = Attention(d, d_x_kv=d_kv, num_heads=num_heads, causal=causal,
@@ -394,7 +401,7 @@ class ChunkedCrossAttentionBlock(nn.Module):
     """
     def __init__(self, chunk_size, d, d_kv, num_heads=1, dropout=0.0):
         nn.Module.__init__(self)
-        if d_kv is None:
+        if dont_have(d_kv):
             d_kv = d
         self.norm = RMSNorm(d)
         self.attention = Attention(d, d_x_kv=d_kv, num_heads=num_heads, offset=chunk_size,
@@ -473,7 +480,7 @@ class Retriever:
         # seq [L, ...]
         seq_chunked = chunkenize(seq, self.chunk_size)  # [C, L//C, ...]
 
-        if seq_chunked is None:  # in this case, the sequence was too short for even a single chunk
+        if dont_have(seq_chunked):  # in this case, the sequence was too short for even a single chunk
             retrieved = None
         else:
             retrieved = torch.randint(
@@ -525,7 +532,7 @@ class Encoder(nn.Module):
 
         # we will use this for weight initialization of the final projection of each
         # attention/ff layer
-        self.for_init = [m for m in chain(self.sa, self.ca, self.ff) if m is not None]
+        self.for_init = [m for m in chain(self.sa, self.ca, self.ff) if have(m)]
 
     def forward(self, y, x):
         """
@@ -535,7 +542,7 @@ class Encoder(nn.Module):
         x = chunkenize(x, self.chunk_size)  # [C, L//C, ..., D]
         for sa, ca, ff in zip(self.sa, self.ca, self.ff):
             y = sa(y)  # [C', N, L//C, ..., D']
-            if ca is not None:
+            if have(ca):
                 y = ca(y, x)  # [C', N, L//C, ..., D']
             y = ff(y)  # [C', N, L//C, ..., D']
         return self.norm(y)  # [C', N, L//C, ..., D']
@@ -581,7 +588,7 @@ class Decoder(nn.Module):
 
         # we will use this for weight initialization of the final projection of each
         # attention/ff layer
-        self.for_init = [m for m in chain(self.sa, self.ca, self.ff) if m is not None]
+        self.for_init = [m for m in chain(self.sa, self.ca, self.ff) if have(m)]
 
     def forward(self, x, y):
         # x: [L, ..., D]
@@ -591,9 +598,9 @@ class Decoder(nn.Module):
 
         for sa, ca, ff in zip(self.sa, self.ca, self.ff):
             x = sa(x)  # [L, ..., D]
-            if ca is not None:
-                if y is not None:  # will be None when sequence was too short for even a single retrieved chunk
-                    if z is None:
+            if have(ca):
+                if have(y):  # will be `None` when sequence was too short for even a single retrieved chunk
+                    if dont_have(z):
                         z = self.encoder(y, x)  # [C', N, L//C, B, D']
                     x = ca(x, z)  # [L, ..., D]
             x = ff(x)  # [L, ..., D]
@@ -693,7 +700,7 @@ class RetroLanguageModel(nn.Module):
 
         # convert tokens to embeddings
         x = self.dropout(self.embedding_dec(seq))  # [L, ..., D]
-        if retrieved is not None:
+        if have(retrieved):
             y = self.dropout(self.embedding_enc(retrieved))  # [C', N, L//C, ..., D']
         else:
             y = None
@@ -702,7 +709,7 @@ class RetroLanguageModel(nn.Module):
         logits = self.to_vocab(self.decoder(x, y))  # [L, ..., V]
 
         # calculate and return loss if labels were given
-        if labels is not None:
+        if have(labels):
             loss = cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
             return logits, loss  # [,]
 
