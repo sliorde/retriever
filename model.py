@@ -81,14 +81,9 @@ from itertools import chain
 
 import torch
 import torch.nn as nn
-from torch.nn.functional import pad, softmax, cross_entropy
+from torch.nn.functional import softmax, cross_entropy
 
-
-def have(x):
-    return x is not None
-
-def dont_have(x):
-    return not have(x)
+from utils import *
 
 
 def chunkenize(x, chunk_size):
@@ -100,12 +95,16 @@ def chunkenize(x, chunk_size):
     `[4,6,5]`, where the `6` is in the chunk index dimension, and `4` is in the
     within-chunk dimension.
     """
-    x = x[:len(x) - (len(x) % chunk_size)]
+    t = len(x) - (len(x) % chunk_size)
+    residue = x[t:]
+    x = x[:t]
     if len(x) == 0:
         chunked = None
     else:
         chunked = torch.reshape(x, (-1, chunk_size, *x.shape[1:])).transpose(0, 1)
-    return chunked
+    if len(residue) == 0:
+        residue = None
+    return chunked, residue
 
 
 def unchunk(x):
@@ -179,8 +178,8 @@ def attention(q, k, v, mask=None, positional_encoding=None, additional_dim=None,
     if have(additional_dim):
         # this is required for the case of chunked-cross attention, where logit vectors
         # from different neighbors are concatenated before applying softmax
-        logits = logits.flatten(additional_dim-1, additional_dim)
-        v = v.flatten(end_dim=additional_dim-1)
+        logits = logits.flatten(additional_dim - 1, additional_dim)
+        v = v.flatten(end_dim=additional_dim - 1)
 
     weights = softmax(logits, 1)
 
@@ -195,6 +194,7 @@ class RMSNorm(nn.Module):
     RMSNorm has some configurations not implemented here. It's not clear from the
     RETRO paper which configuration is used, so here we implement the simplest form.
     """
+
     def __init__(self, d, eps=1e-8, device=None, dtype=None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         nn.Module.__init__(self)
@@ -212,7 +212,7 @@ class RMSNorm(nn.Module):
         return scaled
 
 
-class Attention(nn.Module):
+class Attention(nn.Module, ModuleWithCache):
     """
     attention layer, including optional causal mask and relative positional encoding.
     """
@@ -223,7 +223,7 @@ class Attention(nn.Module):
     mask_cache = dict()
 
     def __init__(self, d, d_x_q=None, d_x_kv=None, d_qk=None, d_v=None, num_heads=1,
-                 causal=False, offset=0, additional_dim=None, dropout=0.0):
+                 causal=False, offset=0, additional_dim=None, dropout=0.0, use_kv_cache=False, use_offset_cache=False):
         """
 
         Parameters
@@ -240,6 +240,7 @@ class Attention(nn.Module):
         dropout:
         """
         nn.Module.__init__(self)
+        ModuleWithCache.__init__(self)
 
         assert have(d)
         if dont_have(d_x_q):
@@ -270,6 +271,8 @@ class Attention(nn.Module):
         self.offset = offset or 0
         self.causal = causal
         self.additional_dim = additional_dim
+        self.use_kv_cache = use_kv_cache
+        self.use_offset_cache = use_offset_cache
 
     def get_causal_mask(self, sz_q, sz_k, offset, device):
 
@@ -343,26 +346,51 @@ class Attention(nn.Module):
         pos_enc = pos_enc[dists - dists.min()]  # [sz_q, sz_k, h, d_qk]
         return pos_enc  # [sz_q, sz_k, h, d_qk]
 
-    def forward(self, x_q, x_kv=None):
+    def forward(self, x_q, x_kv):
         # x_q: [L, ..., D]
         # x_kv: [L', ..., D']
 
-        if dont_have(x_kv):
-            x_kv = x_q
+        q = torch.einsum('hdb,n...b->n...hd', self.to_q, x_q)  # [L, ..., H, D]
 
-        n, m = x_q.size(0), x_kv.size(0)
-        device = x_q.device
+        if x_kv is not None:
+            k = torch.einsum('hdb,m...b->m...hd', self.to_k, x_kv)  # [L', ..., H, D]
+            v = torch.einsum('hdb,m...b->m...hd', self.to_v, x_kv)  # [L', ..., H, D']
+        else:
+            k = None
+            v = None
+
+        offset_fix = 0
+        if self.use_kv_cache:
+            kv_cache = self.get_from_cache('kv')
+            if have(kv_cache):
+                k_cache, v_cache = kv_cache
+
+                if k is None:
+                    k = k_cache.to(q.device)
+                    v = v_cache.to(q.device)
+                else:
+                    k = torch.cat((k_cache.to(k.device), k))
+                    v = torch.cat((v_cache.to(v.device), v))
+
+            self.update_cache((k, v), 'kv')
+
+            if self.use_offset_cache:
+                offset_fix_cache = self.get_from_cache('offset_fix')
+                if dont_have(offset_fix_cache):
+                    offset_fix_cache = 0
+                offset_fix = offset_fix_cache
+                self.update_cache(offset_fix + len(q), 'offset_fix')
+
+        assert k is not None
+
+        n, m = len(q), len(k)
 
         if self.causal:
-            mask = self.get_causal_mask(n, m, self.offset, device)  # [L, L']
+            mask = self.get_causal_mask(n, m, self.offset + offset_fix, q.device)  # [L, L']
         else:
             mask = None
 
-        pos_enc = self.get_pos_enc(n, m, self.offset, device)  # [L, L', H, D]
-
-        q = torch.einsum('hdb,n...b->n...hd', self.to_q, x_q)  # [L, ..., H, D]
-        k = torch.einsum('hdb,m...b->m...hd', self.to_k, x_kv)  # [L', ..., H, D]
-        v = torch.einsum('hdb,m...b->m...hd', self.to_v, x_kv)  # [L', ..., H, D']
+        pos_enc = self.get_pos_enc(n, m, self.offset + offset_fix, q.device)  # [L, L', H, D]
 
         attn = attention(q, k, v, mask, pos_enc, self.additional_dim, self.dropout)  # [L, ..., H, D]
 
@@ -371,47 +399,82 @@ class Attention(nn.Module):
         return out
 
 
-class AttentionBlock(nn.Module):
+class AttentionBlock(nn.Module, ModuleWithCache):
     """
     residual attention with normalization.
     can be used for both self- and cross- attention.
     """
-    def __init__(self, d, d_kv=None, num_heads=1, causal=False, dropout=0.0):
+
+    def __init__(self, d, d_kv=None, num_heads=1, causal=False, dropout=0.0, use_kv_cache=False):
         nn.Module.__init__(self)
+        ModuleWithCache.__init__(self)
+
         if dont_have(d_kv):
             d_kv = d
         self.norm = RMSNorm(d)
         self.attention = Attention(d, d_x_kv=d_kv, num_heads=num_heads, causal=causal,
-                                   dropout=dropout)
+                                   dropout=dropout, use_kv_cache=use_kv_cache, use_offset_cache=use_kv_cache)
         self.dropout = nn.Dropout(dropout)
 
         # we need this for weight initialization:
         self.to_out = self.attention.to_o
 
+        self.register_modules_with_cache(self.attention)
+
     def forward(self, x_q, x_kv=None):
         # x_q: [L, ..., D]
         # x_kv: [L', ..., D']
 
-        return x_q + self.dropout(self.attention(self.norm(x_q), x_kv))  # [L, ..., D]
+        x_q_normed = self.norm(x_q)
+
+        if x_kv is None:
+            x_kv = x_q_normed
+
+        return x_q + self.dropout(self.attention(x_q_normed, x_kv))  # [L, ..., D]
 
 
-class ChunkedCrossAttentionBlock(nn.Module):
+class ChunkedCrossAttentionBlock(nn.Module, ModuleWithCache):
     """
     residual chunked cross attention with normalization.
     """
+
     def __init__(self, chunk_size, d, d_kv, num_heads=1, dropout=0.0):
         nn.Module.__init__(self)
+        ModuleWithCache.__init__(self)
+
         if dont_have(d_kv):
             d_kv = d
         self.norm = RMSNorm(d)
-        self.attention = Attention(d, d_x_kv=d_kv, num_heads=num_heads, offset=chunk_size,
-                                   additional_dim=2)
+        self.attention = Attention(d, d_x_kv=d_kv, num_heads=num_heads, offset=chunk_size - 1,
+                                   additional_dim=2, use_kv_cache=True, use_offset_cache=False)
         self.dropout = nn.Dropout(dropout)
 
         self.chunk_size = chunk_size
 
         # we need this for weight initialization:
         self.to_out = self.attention.to_o
+
+        self.register_modules_with_cache(self.attention)
+
+    @staticmethod
+    def get_stuff(pos, length, chunk_size):
+        num_elements_to_omit = max(0, chunk_size - 1 - pos)
+        num_elements_to_keep = length - num_elements_to_omit
+        len_x_q_padded = chunk_size * (((pos + length) // chunk_size) - (max(0, pos - (chunk_size - 1)) // chunk_size))
+        # len_x_q_padded = ((num_elements_to_keep + chunk_size - 1) // chunk_size) * chunk_size
+        ind1_x_q = num_elements_to_omit
+        ind1_x_q_padded = (num_elements_to_omit + pos + 1) % chunk_size
+        ind2_x_q_padded = ind1_x_q_padded + num_elements_to_keep
+        ind1_z_padded = ind1_x_q
+        ind2_z_padded = ind1_z_padded + num_elements_to_keep
+
+        return \
+            len_x_q_padded, \
+            ind1_x_q, \
+            ind1_x_q_padded, \
+            ind2_x_q_padded, \
+            ind1_z_padded, \
+            ind2_z_padded
 
     def forward(self, x_q, x_kv):
         # x_q: [L, ..., D]
@@ -423,20 +486,43 @@ class ChunkedCrossAttentionBlock(nn.Module):
         # when chunking, we make sure that no `x_q` element can attend a future chunk,
         # otherwise we would break causality.
         # see explanation in RETRO paper.
-        x_q_chunked = chunkenize(
-            pad(self.norm(x_q)[self.chunk_size - 1:], (0, 0) * (x_q.ndim - 1) +
-                (0, self.chunk_size - 1)),
-            self.chunk_size)  # [C, L//C, ..., D]
-        z = self.attention(x_q_chunked, x_kv)  # [C, L//C , ..., D]
-        z = pad(unchunk(z), (0, 0) * (x_q.ndim - 1) + (z.size(0) - 1, 0))[
-            :x_q.size(0)]  # [L, ..., D]
-        return x_q + self.dropout(z)  # [L, ..., D]
+
+        pos = 0
+        pos_cached = self.get_from_cache('pos')
+        if have(pos_cached):
+            pos = pos_cached
+        self.update_cache((pos + len(x_q)), 'pos')
+
+        if x_kv is None:
+            return x_q
+
+        chunk_size = self.chunk_size
+
+        len_x_q_padded, ind1_x_q, ind1_x_q_padded, \
+        ind2_x_q_padded, ind1_z_padded, ind2_z_padded = self.get_stuff(pos, len(x_q), chunk_size)
+
+        x_q_padded = torch.zeros((len_x_q_padded, *x_q.shape[1:]), device=x_q.device)
+        x_q_padded[ind1_x_q_padded:ind2_x_q_padded] = x_q[ind1_x_q:]
+        x_q_chunked, _ = chunkenize(x_q_padded, chunk_size)  # [C, L//C, ..., D]
+        z_chunked = self.attention(x_q_chunked, x_kv)  # [C, L//C , ..., D]
+        if (pos + len(x_q) + 1) % chunk_size == 0:
+            self.attention.update_cache(None, 'kv')
+        else:
+            kv_cache = self.attention.get_from_cache('kv')
+            if have(kv_cache):
+                slc = (slice(None), slice(None), slice(-1, None), ...)
+                self.attention.update_cache((kv_cache[0][slc], kv_cache[1][slc]), 'kv')
+        z = unchunk(z_chunked)
+        z_padded = torch.zeros_like(x_q)
+        z_padded[ind1_z_padded:ind2_z_padded] = z[ind1_x_q_padded:ind2_x_q_padded]
+        return x_q + self.dropout(z_padded)  # [L, ..., D]
 
 
 class FeedForwardBlock(nn.Module):
     """
     residual MLP with normalization.
     """
+
     def __init__(self, d, d_ff, dropout=0.0):
         nn.Module.__init__(self)
         self.norm = RMSNorm(d)
@@ -456,11 +542,12 @@ class FeedForwardBlock(nn.Module):
         return x + self.mlp(self.norm(x))  # [..., D]
 
 
-class Retriever:
+class Retriever(ModuleWithCache):
     """
     currently, this is a dummy retriever. later we will implement a retriever based
     on BERT and approximate-KNN
     """
+
     def __init__(
             self,
             vocab_size,
@@ -468,6 +555,8 @@ class Retriever:
             continuation_length,
             num_neighbors
     ):
+        ModuleWithCache.__init__(self)
+
         self.vocab_size = vocab_size
         self.chunk_size = chunk_size
         self.continuation_length = continuation_length
@@ -478,7 +567,11 @@ class Retriever:
         temporary dummy function that maintains causality
         """
         # seq [L, ...]
-        seq_chunked = chunkenize(seq, self.chunk_size)  # [C, L//C, ...]
+        last_partial_chunk = self.get_from_cache('last_partial_chunk')
+        if have(last_partial_chunk):
+            seq = torch.cat((last_partial_chunk.to(seq.device), seq))
+
+        seq_chunked, last_partial_chunk = chunkenize(seq, self.chunk_size)  # [C, L//C, ...]
 
         if dont_have(seq_chunked):  # in this case, the sequence was too short for even a single chunk
             retrieved = None
@@ -491,12 +584,17 @@ class Retriever:
                 device=seq.device,
                 generator=torch.Generator(device=seq.device).manual_seed(29847892371)
             )  # [L//C, C', N, ...]
-            retrieved = retrieved.movedim(0, 2)   # [C', N, L//C, ...]
+            retrieved = retrieved.movedim(0, 2)  # [C', N, L//C, ...]
+
+        self.update_cache(last_partial_chunk, 'last_partial_chunk')
 
         return retrieved
 
+    def __call__(self, *args, **kwargs):
+        return self.retrieve(*args, **kwargs)
 
-class Encoder(nn.Module):
+
+class Encoder(nn.Module, ModuleWithCache):
     def __init__(
             self,
             num_layers,
@@ -509,6 +607,7 @@ class Encoder(nn.Module):
             dropout=0.0
     ):
         nn.Module.__init__(self)
+        ModuleWithCache.__init__(self)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -539,16 +638,23 @@ class Encoder(nn.Module):
         y: [C', N, L//C, ..., D']
         x: [L, ..., D]
         """
-        x = chunkenize(x, self.chunk_size)  # [C, L//C, ..., D]
-        for sa, ca, ff in zip(self.sa, self.ca, self.ff):
-            y = sa(y)  # [C', N, L//C, ..., D']
-            if have(ca):
-                y = ca(y, x)  # [C', N, L//C, ..., D']
-            y = ff(y)  # [C', N, L//C, ..., D']
-        return self.norm(y)  # [C', N, L//C, ..., D']
+        last_partial_x_chunk = self.get_from_cache('last_partial_x_chunk')
+        if have(last_partial_x_chunk):
+            x = torch.cat((last_partial_x_chunk.to(x.device), x))
+        x_chunked, last_partial_x_chunk = chunkenize(x, self.chunk_size)  # [C, L//C, ..., D]
+        self.update_cache(last_partial_x_chunk, 'last_partial_x_chunk')
+        if dont_have(y):
+            return None
+        else:
+            for sa, ca, ff in zip(self.sa, self.ca, self.ff):
+                y = sa(y)  # [C', N, L//C, ..., D']
+                if have(ca):
+                    y = ca(y, x_chunked)  # [C', N, L//C, ..., D']
+                y = ff(y)  # [C', N, L//C, ..., D']
+            return self.norm(y)  # [C', N, L//C, ..., D']
 
 
-class Decoder(nn.Module):
+class Decoder(nn.Module, ModuleWithCache):
     def __init__(
             self,
             num_layers,
@@ -562,6 +668,7 @@ class Decoder(nn.Module):
             encoder,
             dropout=0.0):
         nn.Module.__init__(self)
+        ModuleWithCache.__init__(self)
 
         self.encoder = encoder
         self.dropout = nn.Dropout(dropout)
@@ -571,7 +678,7 @@ class Decoder(nn.Module):
 
         # self-attention blocks
         self.sa = nn.ModuleList(
-            [AttentionBlock(d, num_heads=num_heads, causal=True, dropout=dropout)
+            [AttentionBlock(d, num_heads=num_heads, causal=True, dropout=dropout, use_kv_cache=True)
              for _ in range(num_layers)])
 
         # cross-attention blocks
@@ -582,6 +689,9 @@ class Decoder(nn.Module):
         # feed-forward blocks
         self.ff = nn.ModuleList([FeedForwardBlock(d, d_ff, dropout=dropout)
                                  for _ in range(num_layers)])
+
+        # normalization
+        self.for_enc_norm = RMSNorm(d)
         self.norm = RMSNorm(d)
 
         self.chunk_size = chunk_size
@@ -590,27 +700,31 @@ class Decoder(nn.Module):
         # attention/ff layer
         self.for_init = [m for m in chain(self.sa, self.ca, self.ff) if have(m)]
 
+        self.register_modules_with_cache(list(self.sa + self.ca))
+
     def forward(self, x, y):
         # x: [L, ..., D]
         # y: [C', N, L//C, ..., D']
-
         z = None
+        encoded = False
 
         for sa, ca, ff in zip(self.sa, self.ca, self.ff):
             x = sa(x)  # [L, ..., D]
             if have(ca):
-                if have(y):  # will be `None` when sequence was too short for even a single retrieved chunk
-                    if dont_have(z):
-                        z = self.encoder(y, x)  # [C', N, L//C, B, D']
-                    x = ca(x, z)  # [L, ..., D]
+                if not encoded:
+                    z = self.encoder(y, self.for_enc_norm(x))  # [C', N, L//C, B, D']
+                    encoded = True
+                x = ca(x, z)  # [L, ..., D]
             x = ff(x)  # [L, ..., D]
+
         return self.norm(x)  # [L, ..., D]
 
 
-class RetroLanguageModel(nn.Module):
+class RetroLanguageModel(nn.Module, ModuleWithCache):
     """
     combines RETRO decoder, encoder, embeddings, and output projection to vocab.
     """
+
     def __init__(
             self,
             vocab_size,
@@ -632,6 +746,7 @@ class RetroLanguageModel(nn.Module):
             share_embeddings=False
     ):
         nn.Module.__init__(self)
+        ModuleWithCache.__init__(self)
 
         assert (not share_embeddings) or (d_enc == d_dec)
 
@@ -646,6 +761,10 @@ class RetroLanguageModel(nn.Module):
                                ca_start_dec, ca_freq_dec, chunk_size, encoder, dropout)
         self.to_vocab = nn.Linear(d_dec, vocab_size)
         self.dropout = nn.Dropout(dropout)
+
+        self.register_modules_with_cache([self.retriever, self.decoder, self.encoder])
+
+        self.chunk_size = chunk_size
 
         self.reset_parameters()
 
@@ -696,7 +815,7 @@ class RetroLanguageModel(nn.Module):
     def forward(self, seq, labels=None):
 
         # retrieve neighbors from database, for each chunk in `seq`
-        retrieved = self.retriever.retrieve(seq)  # [C', N, L//C, ...]
+        retrieved = self.retriever(seq)  # [C', N, L//C, ...]
 
         # convert tokens to embeddings
         x = self.dropout(self.embedding_dec(seq))  # [L, ..., D]
@@ -706,12 +825,13 @@ class RetroLanguageModel(nn.Module):
             y = None
 
         # apply decoder and language model head
-        logits = self.to_vocab(self.decoder(x, y))  # [L, ..., V]
+        dec_out = self.decoder(x, y)  # [L, ..., D]
+
+        logits = self.to_vocab(dec_out)  # [L, ..., V]
 
         # calculate and return loss if labels were given
+        loss = None
         if have(labels):
             loss = cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
-            return logits, loss  # [,]
 
-        else:
-            return logits  # [L, ..., V]
+        return logits, loss
