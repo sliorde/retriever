@@ -87,6 +87,7 @@ from torch.nn.functional import pad, softmax, cross_entropy
 def have(x):
     return x is not None
 
+
 def dont_have(x):
     return not have(x)
 
