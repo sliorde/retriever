@@ -84,28 +84,23 @@ import torch.nn as nn
 from torch.nn.functional import pad, softmax, cross_entropy
 
 
-def chunkenize(x, chunk_size, dim=0):
+def chunkenize(x, chunk_size):
     """
     given a tensor with a sequence dimension, reshape this dimension to two dimensions:
     one for indexing the chunk and one for indexing position within a chunk.
-    `dim` is the sequence dimension.
-    For example, if `x` is a tensor with shape`[24,1,2,3,4,5]` representing a sequence of
-    length `24` and we use `dim=0` and `chunk_size=4`, we will get a tensor with shape
-    `[4,6,1,2,3,4,5]`, where the `6` is in the chunk index dimension, and `4` is in the
+    For example, if `x` is a tensor with shape`[24,5]` representing a sequence of
+    length `24` and we use `chunk_size=4`, we will get a tensor with shape
+    `[4,6,5]`, where the `6` is in the chunk index dimension, and `4` is in the
     within-chunk dimension.
-
-    TODO: maybe we should change the ordering of dimensions of all objects so that we
-     don't need to do transpose here. The transpose operation incurs a copy later.
     """
-    dim = dim % x.ndim
-    return torch.reshape(x, (*x.shape[:dim], -1, chunk_size, *x.shape[(dim + 1):])).transpose(dim, dim + 1)
+    return torch.reshape(x, (-1, chunk_size, *x.shape[1:])).transpose(0, 1)
 
 
-def unchunk(x, dim=0):
+def unchunk(x):
     """
     the inverse of `chunkenize()`
     """
-    return torch.reshape(x.transpose(dim, dim + 1), (*x.shape[:dim], -1, *x.shape[(dim + 2):]))
+    return torch.reshape(x.transpose(0, 1), (-1, *x.shape[2:]))
 
 
 def attention(q, k, v, mask=None, positional_encoding=None, additional_dim=None, dropout=None,
