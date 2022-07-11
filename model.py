@@ -93,7 +93,12 @@ def chunkenize(x, chunk_size):
     `[4,6,5]`, where the `6` is in the chunk index dimension, and `4` is in the
     within-chunk dimension.
     """
-    return torch.reshape(x, (-1, chunk_size, *x.shape[1:])).transpose(0, 1)
+    x = x[:len(x) - (len(x)%chunk_size)]
+    if len(x) == 0:
+        chunked = None
+    else:
+        chunked = torch.reshape(x, (-1, chunk_size, *x.shape[1:])).transpose(0, 1)
+    return chunked
 
 
 def unchunk(x):
@@ -468,15 +473,20 @@ class Retriever:
         # seq [L, ...]
         seq_chunked = chunkenize(seq, self.chunk_size)  # [C, L//C, ...]
 
-        retrieved = torch.randint(
-            self.vocab_size,
-            (seq_chunked.shape[1],
-             self.chunk_size + self.continuation_length, self.num_neighbors,
-             *seq_chunked.shape[2:]),
-            device=seq.device,
-            generator=torch.Generator(device=seq.device).manual_seed(29847892371)
-        )  # [L//C, C', N, ...]
-        return retrieved.movedim(0, 2)  # [C', N, L//C, ...]
+        if seq_chunked is None: # in this case, the sequence was too short for even a single chunk
+            retrieved = None
+        else:
+            retrieved = torch.randint(
+                self.vocab_size,
+                (seq_chunked.shape[1],
+                 self.chunk_size + self.continuation_length, self.num_neighbors,
+                 *seq_chunked.shape[2:]),
+                device=seq.device,
+                generator=torch.Generator(device=seq.device).manual_seed(29847892371)
+            )  # [L//C, C', N, ...]
+            retrieved = retrieved.movedim(0, 2)   # [C', N, L//C, ...]
+
+        return retrieved
 
 
 class Encoder(nn.Module):
@@ -582,9 +592,10 @@ class Decoder(nn.Module):
         for sa, ca, ff in zip(self.sa, self.ca, self.ff):
             x = sa(x)  # [L, ..., D]
             if ca is not None:
-                if z is None:
-                    z = self.encoder(y, x)  # [C', N, L//C, B, D']
-                x = ca(x, z)  # [L, ..., D]
+                if y is not None: # will be None when sequence was too short for even a single retrieved chunk
+                    if z is None:
+                        z = self.encoder(y, x)  # [C', N, L//C, B, D']
+                    x = ca(x, z)  # [L, ..., D]
             x = ff(x)  # [L, ..., D]
         return self.norm(x)  # [L, ..., D]
 
@@ -682,7 +693,10 @@ class RetroLanguageModel(nn.Module):
 
         # convert tokens to embeddings
         x = self.dropout(self.embedding_dec(seq))  # [L, ..., D]
-        y = self.dropout(self.embedding_enc(retrieved))  # [C', N, L//C, ..., D']
+        if retrieved is not None:
+            y = self.dropout(self.embedding_enc(retrieved))  # [C', N, L//C, ..., D']
+        else:
+            y = None
 
         # apply decoder and language model head
         logits = self.to_vocab(self.decoder(x, y))  # [L, ..., V]
