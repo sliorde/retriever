@@ -18,7 +18,7 @@ During training and inference, RETRO retrieves items from the database based on 
 to its input, and incorporates the retrieved items into the forward pass through a cross-attention
 mechanism.
 
-The potentials benefits of RETRO:
+The potential benefits of RETRO:
  * Same performance as other transformer-based large language models, but with a much smaller
    model. The paper reports that a 7.5B parameter RETRO model is on par, and sometimes
    outperforms, strong models with 175B and 280B parameters (Jurrasic-1 and Gopher).
@@ -31,13 +31,13 @@ The potentials benefits of RETRO:
  * A trained RETRO model can be easily updated to different contexts or tasks simply by updating
    the retrieval database, without needing to change the model's parameters.
  * Adding items to the retrieval database, without modifying the trained RETRO model, improves
-   the performance. This means that a model can be improved simply by collecting more data
-   and without needing to retrain.
+   the performance. This means that a model can be improved ("learn new knowledge") simply by
+   collecting more data and without needing to retrain.
 
 
 2) Notes on this implementation
 -------------------------------
-This implementation is done in Python+PyTroch.
+This implementation is done in Python+PyTorch.
 The original RETRO implementation was not publicly released by DeepMind (as of the time of writing
 this).
 We tried to be very close to the RETRO paper, but some details in the paper are missing, so we
@@ -60,7 +60,9 @@ in inline comments, we designate tensor sizes using this general rule:
   D = generic dimension size
   D' = generic dimension size
   V = vocabulary size
-  elipsis (...) = hides batch dimensions
+  batch dimension is hidden behind ellipsis (...)
+  (different occurrences of D might designate different numbers. the idea is mostly to track
+   different types of dimensions...)
 
 
 
@@ -74,29 +76,12 @@ in inline comments, we designate tensor sizes using this general rule:
 """
 
 from math import sqrt
-from functools import lru_cache, partial
+from functools import partial
 from itertools import chain
 
 import torch
 import torch.nn as nn
 from torch.nn.functional import pad, softmax, cross_entropy
-import opt_einsum
-
-
-def view_or_reshape(x, *tensor_or_shape):
-    """
-    change the view of tensor x to the specified shape or to the specified tensor's shape; if
-    impossible, reshape (`reshape` incurs a copy whereas `view` does not)
-    """
-    if isinstance(tensor_or_shape[0], torch.Tensor):
-        shape = tensor_or_shape[0].shape
-    else:
-        shape = tensor_or_shape
-    try:
-        x = x.view(shape)
-    except RuntimeError:
-        x = x.reshape(shape) 
-    return x
 
 
 def chunkenize(x, chunk_size, dim=0):
@@ -113,72 +98,48 @@ def chunkenize(x, chunk_size, dim=0):
      don't need to do transpose here. The transpose operation incurs a copy later.
     """
     dim = dim % x.ndim
-    return view_or_reshape(x, *x.shape[:dim], -1, chunk_size,
-                           *x.shape[(dim + 1):]).transpose(dim, dim + 1)
+    return torch.reshape(x, (*x.shape[:dim], -1, chunk_size, *x.shape[(dim + 1):])).transpose(dim, dim + 1)
 
 
 def unchunk(x, dim=0):
     """
     the inverse of `chunkenize()`
     """
-    return view_or_reshape(x.transpose(dim, dim + 1), *x.shape[:dim], -1, *x.shape[(dim + 2):])
+    return torch.reshape(x.transpose(dim, dim + 1), (*x.shape[:dim], -1, *x.shape[(dim + 2):]))
 
 
-@lru_cache(50)
-def cached_einsum_path(subscripts, *shapes):
-    """
-    torch.einsum does not optimize the contraction path in the case of multiplying more
-    than two tensors. Therefore, we use the `opt_einsum` library. But, since we don't
-    want to calculate the optimal path everytime, we calculate it once and cache the
-    result.
-    """
-    return opt_einsum.contract_expression(subscripts, *shapes)
-
-
-def einsum(subscripts, *operands):
-    """
-    this function is like `torch.einsum`, but uses an optimal contraction path.
-    see docstring of function `cached_einsum_path()`.
-    """
-    path = cached_einsum_path(subscripts, *[tuple(o.shape) for o in operands])
-    return path(*operands)
-
-
-def attention(x_q, x_kv, to_q, to_k, to_v, to_out, mask=None, positional_encoding=None,
-              flatten_dims=None, dropout=None):
+def attention(q, k, v, mask=None, positional_encoding=None, additional_dim=None, dropout=None,
+              rescale_logits=False):
     """
     attention operation.
-    very roughly (without mentioning contraction indexes):
-        output = to_out(softmax(to_q(x_q)*[to_k(x_kv)+positional_encoding+mask])*to_v(x_kv))
 
-    this function is implemented to allow a more general attention than required for RETRO.
-    In particular, it works also without positional embedding, and the batch dimensions can
-    be of any shape.
-        
+    this function is implemented to allow a more general attention than required for RETRO:
+    it works also without positional embedding, and the batch dimensions can be of any shape.
+
     in einsum strings, these are the meaning of index names:
-     d,b,c : vector dimensions
+     d : vector dimensions
      n,m : sequence dimensions
      h : attention head dimension
      ellipsis (...) hides batch, neighbor, and chunk dimensions.
 
     Parameters
     ----------
-    x_q: input sequence of length N, will be converted to queries
-    x_kv: other input sequence, of length M. will be converted to keys and values
-    to_q: matrix that will convert `x_q` to N queries
-    to_k: matrix that will convert `x_kv` to M keys
-    to_v: matrix that will convert `x_kv` to M values
-    to_out: matrix that will convert the N combined values (post-attention) to the output
-        sequence of length N
-    mask: (optional) boolean mask of size N-by-M, `True` indicates that a position is masked.
+    q: query sequence of length L, for each head
+    k: key sequence of length L', for each head
+    v: value sequence of length L', for each head
+    mask: (optional) boolean mask of size L-by-L', `True` indicates that a position is masked.
         used for causal masking.
     positional_encoding: (optional) tensor that will be multiplied by the queries and then
         added to the logits (pre-softmax), used for relative positional encoding.
-    flatten_dims:
+    additional_dim:
     dropout:
+    rescale_logits:
     """
+
+    content_logits = torch.einsum('n...hd,m...hd->nm...h', q, k)
+
     if positional_encoding is None:
-        logits = einsum('dhb,n...b,dhc,m...c->nm...h', to_q, x_q, to_k, x_kv)
+        position_logits = 0.0
     else:
         # as explained elsewhere in this source code, we use the relative positional
         # encoding of transformerXL (https://arxiv.org/pdf/1901.02860.pdf), but without
@@ -189,53 +150,37 @@ def attention(x_q, x_kv, to_q, to_k, to_v, to_out, mask=None, positional_encodin
         #   > self-attention block.
         # This sentence makes it seem as if they don't use the bias terms (but it's not
         # 100% clear).
-        q = einsum('dhb,n...b->nd...h', to_q, x_q)
-        content_logits = einsum('nd...h,dhc,m...c->nm...h', q, to_k, x_kv)
-        position_logits = einsum('nd...h,nmdh->nm...h', q, positional_encoding)
+        position_logits = torch.einsum('n...hd,nmhd->nm...h', q, positional_encoding)
 
-        # reshape in-case sizes are different. This happens when the content logits
-        # contain an additional neigbor dimension.
-        dim_diff = position_logits.ndim - content_logits.ndim
-        if dim_diff > 0:
-            content_logits = view_or_reshape(
-                content_logits,
-                *content_logits.shape[:2],
-                *(1,) * dim_diff,
-                *content_logits.shape[2:]
-            )
-        elif dim_diff < 0:
-            position_logits = view_or_reshape(
-                position_logits,
-                *position_logits.shape[:2],
-                *(1,) * (-dim_diff),
-                *position_logits.shape[2:]
-            )
-        logits = content_logits + position_logits
+        # this is required for the case of chunked-cross attention, where content logit contain
+        # an additional neighbor dimension
+        if additional_dim is not None:
+            position_logits.unsqueeze_(additional_dim)
 
-    rescale_logits = False
+    logits = content_logits + position_logits
+
     if rescale_logits:
         # scale the logits, as in the original attention paper. we add this, even though
         # it's not clear if it is used in RETRO. In the RETRO paper, equation (4) and
         # listing 1, it does not appear.
-        logits /= sqrt(to_q.size(0))
+        logits /= sqrt(q.size(-1))
 
     if mask is not None:
         logits.masked_fill_(mask[(slice(None), slice(None), *(None,) * (logits.ndim - 2))],
                             float('-inf'))
 
-    if flatten_dims is not None:
-        # this is required for the case of chunked-cross attention, where logit vecrors
+    if additional_dim is not None:
+        # this is required for the case of chunked-cross attention, where logit vectors
         # from different neighbors are concatenated before applying softmax
-        logits = view_or_reshape(logits, logits.size(0), -1, *logits.shape[flatten_dims + 1:])
-        x_kv = view_or_reshape(x_kv, -1, *x_kv.shape[flatten_dims:])
+        logits = logits.flatten(additional_dim-1, additional_dim)
+        v = v.flatten(end_dim=additional_dim-1)
 
     weights = softmax(logits, 1)
 
     if dropout is not None:
         weights = dropout(weights)
 
-    out = einsum('dch,chb,m...b,nm...h->n...d', to_out, to_v, x_kv, weights)
-    return out
+    return torch.einsum('nm...h,m...hd->n...hd', weights, v)
 
 
 class RMSNorm(nn.Module):
@@ -271,7 +216,7 @@ class Attention(nn.Module):
     mask_cache = dict()
 
     def __init__(self, d, d_x_q=None, d_x_kv=None, d_qk=None, d_v=None, num_heads=1,
-                 causal=False, offset=0, flatten_dims=None, dropout=0.0):
+                 causal=False, offset=0, additional_dim=None, dropout=0.0):
         """
 
         Parameters
@@ -284,7 +229,7 @@ class Attention(nn.Module):
         num_heads: number of attention heads
         causal: should disallow attention to future tokens?
         offset: offset between query and key positions, for relative positional encoding
-        flatten_dims:
+        additional_dim:
         dropout:
         """
         nn.Module.__init__(self)
@@ -302,11 +247,11 @@ class Attention(nn.Module):
             assert d_v * num_heads == d
         d_out = d
 
-        self.to_q = nn.Parameter(torch.randn(d_qk, num_heads, d_x_q))
-        self.to_k = nn.Parameter(torch.randn(d_qk, num_heads, d_x_kv))
-        self.to_v = nn.Parameter(torch.randn(d_v, num_heads, d_x_kv))
-        self.to_out = nn.Parameter(torch.randn(d_out, d_v, num_heads))
-        self.for_pos_enc = nn.Parameter(torch.randn(d_qk, num_heads, d_x_kv))
+        self.to_q = nn.Parameter(torch.randn(num_heads, d_qk, d_x_q))
+        self.to_k = nn.Parameter(torch.randn(num_heads, d_qk, d_x_kv))
+        self.to_v = nn.Parameter(torch.randn(num_heads, d_v, d_x_kv))
+        self.for_pos_enc = nn.Parameter(torch.randn(num_heads, d_qk, d_x_kv))
+        self.to_o = nn.Parameter(torch.randn(d_out, num_heads, d_v))
 
         self.dropout = nn.Dropout(dropout)
 
@@ -317,14 +262,14 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.offset = offset or 0
         self.causal = causal
-        self.flatten_dims = flatten_dims
+        self.additional_dim = additional_dim
 
     def get_causal_mask(self, sz_q, sz_k, offset, device):
 
         # first, check if mask is already in cache
         key = (sz_q, sz_k, offset)
         if key in self.mask_cache:
-            mask = self.mask_cache[key].to(device)
+            mask = self.mask_cache[key].to(device)  # [sz_q, sz_k]
 
         # otherwise, create mask
         else:
@@ -383,13 +328,13 @@ class Attention(nn.Module):
                 self.sincos_cache.pop(next(iter(self.sincos_cache)))
 
         # apply linear transform
-        pos_enc = einsum('dhb,nb->ndh', self.for_pos_enc,
-                         self.dropout(sincos))  # [sz_q+sz_k-1, d_qk, h]
+        pos_enc = torch.einsum('hdb,nb->nhd', self.for_pos_enc,
+                               self.dropout(sincos))  # [sz_q+sz_k-1, h, d_qk]
 
         # reshape so that `pos_enc[i,j]` will reflect relative position of query `i` and
         # key 'j'.
-        pos_enc = pos_enc[dists - dists.min()]  # [sz_q, sz_k, d_qk, h]
-        return pos_enc  # [sz_q, sz_k, d_qk, h]
+        pos_enc = pos_enc[dists - dists.min()]  # [sz_q, sz_k, h, d_qk]
+        return pos_enc  # [sz_q, sz_k, h, d_qk]
 
     def forward(self, x_q, x_kv=None):
         # x_q: [L, ..., D]
@@ -406,10 +351,17 @@ class Attention(nn.Module):
         else:
             mask = None
 
-        pos_enc = self.get_pos_enc(n, m, self.offset, device)  # [L, L', D, H]
+        pos_enc = self.get_pos_enc(n, m, self.offset, device)  # [L, L', H, D]
 
-        return attention(x_q, x_kv, self.to_q, self.to_k, self.to_v, self.to_out,
-                         mask, pos_enc, self.flatten_dims, self.dropout)  # [L, ..., D]
+        q = torch.einsum('hdb,n...b->n...hd', self.to_q, x_q)  # [L, ..., H, D]
+        k = torch.einsum('hdb,m...b->m...hd', self.to_k, x_kv)  # [L', ..., H, D]
+        v = torch.einsum('hdb,m...b->m...hd', self.to_v, x_kv)  # [L', ..., H, D']
+
+        attn = attention(q, k, v, mask, pos_enc, self.additional_dim, self.dropout)  # [L, ..., H, D]
+
+        out = torch.einsum('dhb,n...hb->n...d', self.to_o, attn)  # [L, ..., D]
+
+        return out
 
 
 class AttentionBlock(nn.Module):
@@ -427,7 +379,7 @@ class AttentionBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # we need this for weight initialization:
-        self.to_out = self.attention.to_out
+        self.to_out = self.attention.to_o
 
     def forward(self, x_q, x_kv=None):
         # x_q: [L, ..., D]
@@ -446,13 +398,13 @@ class ChunkedCrossAttentionBlock(nn.Module):
             d_kv = d
         self.norm = RMSNorm(d)
         self.attention = Attention(d, d_x_kv=d_kv, num_heads=num_heads, offset=chunk_size,
-                                   flatten_dims=2)
+                                   additional_dim=2)
         self.dropout = nn.Dropout(dropout)
 
         self.chunk_size = chunk_size
 
         # we need this for weight initialization:
-        self.to_out = self.attention.to_out
+        self.to_out = self.attention.to_o
 
     def forward(self, x_q, x_kv):
         # x_q: [L, ..., D]
@@ -693,6 +645,7 @@ class RetroLanguageModel(nn.Module):
         be the std, not variance).
 
         """
+
         def xavier_(p):
             nn.init.xavier_normal_(p.view(-1, p.size(-1)), 1.0)
 
@@ -706,7 +659,7 @@ class RetroLanguageModel(nn.Module):
                 assert len(list(module.parameters())) == 1  # scale
                 nn.init.constant_(module.scale, 1.0)
             elif isinstance(module, Attention):
-                assert len(list(module.parameters())) == 5  # to_q, to_k, to_v, to_out, for_pos_enc
+                assert len(list(module.parameters())) == 5  # to_q, to_k, to_v, to_o, for_pos_enc
                 for p in module.parameters():
                     init_func(p)
             elif isinstance(module, nn.Linear):
