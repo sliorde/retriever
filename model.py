@@ -93,7 +93,7 @@ def chunkenize(x, chunk_size):
     `[4,6,5]`, where the `6` is in the chunk index dimension, and `4` is in the
     within-chunk dimension.
     """
-    x = x[:len(x) - (len(x)%chunk_size)]
+    x = x[:len(x) - (len(x) % chunk_size)]
     if len(x) == 0:
         chunked = None
     else:
@@ -473,7 +473,7 @@ class Retriever:
         # seq [L, ...]
         seq_chunked = chunkenize(seq, self.chunk_size)  # [C, L//C, ...]
 
-        if seq_chunked is None: # in this case, the sequence was too short for even a single chunk
+        if seq_chunked is None:  # in this case, the sequence was too short for even a single chunk
             retrieved = None
         else:
             retrieved = torch.randint(
@@ -592,7 +592,7 @@ class Decoder(nn.Module):
         for sa, ca, ff in zip(self.sa, self.ca, self.ff):
             x = sa(x)  # [L, ..., D]
             if ca is not None:
-                if y is not None: # will be None when sequence was too short for even a single retrieved chunk
+                if y is not None:  # will be None when sequence was too short for even a single retrieved chunk
                     if z is None:
                         z = self.encoder(y, x)  # [C', N, L//C, B, D']
                     x = ca(x, z)  # [L, ..., D]
