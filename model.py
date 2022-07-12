@@ -255,10 +255,13 @@ class Attention(nn.Module):
             assert d_v * num_heads == d
         d_out = d
 
-        self.to_q = nn.Parameter(torch.randn(num_heads, d_qk, d_x_q))
-        self.to_kv = nn.Parameter(torch.randn(num_heads, d_qk + d_v, d_x_kv))
-        self.for_pos_enc = nn.Parameter(torch.randn(num_heads, d_qk, d_x_kv))
-        self.to_o = nn.Parameter(torch.randn(d_out, num_heads, d_v))
+        def parameter(*sz):
+            return nn.Parameter(torch.randn(*sz))
+
+        self.to_q = parameter(num_heads, d_qk, d_x_q)
+        self.to_kv = parameter(num_heads, d_qk + d_v, d_x_kv)
+        self.for_pos_enc = parameter(num_heads, d_qk, d_x_kv)
+        self.to_o = parameter(d_out, num_heads, d_v)
 
         self.dropout = nn.Dropout(dropout)
 
