@@ -256,8 +256,7 @@ class Attention(nn.Module):
         d_out = d
 
         self.to_q = nn.Parameter(torch.randn(num_heads, d_qk, d_x_q))
-        self.to_k = nn.Parameter(torch.randn(num_heads, d_qk, d_x_kv))
-        self.to_v = nn.Parameter(torch.randn(num_heads, d_v, d_x_kv))
+        self.to_kv = nn.Parameter(torch.randn(num_heads, d_qk + d_v, d_x_kv))
         self.for_pos_enc = nn.Parameter(torch.randn(num_heads, d_qk, d_x_kv))
         self.to_o = nn.Parameter(torch.randn(d_out, num_heads, d_v))
 
@@ -362,8 +361,9 @@ class Attention(nn.Module):
         pos_enc = self.get_pos_enc(n, m, self.offset, device)  # [L, L', H, D]
 
         q = torch.einsum('hdb,n...b->n...hd', self.to_q, x_q)  # [L, ..., H, D]
-        k = torch.einsum('hdb,m...b->m...hd', self.to_k, x_kv)  # [L', ..., H, D]
-        v = torch.einsum('hdb,m...b->m...hd', self.to_v, x_kv)  # [L', ..., H, D']
+        kv = torch.einsum('hdb,m...b->m...hd', self.to_kv, x_kv)  # [L', ..., H, D+D']
+        k = kv[...,:self.d_qk] # [L', ..., H, D]
+        v = kv[..., self.d_qk:] # [L', ..., H, D']
 
         attn = attention(q, k, v, mask, pos_enc, self.additional_dim, self.dropout)  # [L, ..., H, D]
 
@@ -673,7 +673,7 @@ class RetroLanguageModel(nn.Module):
                 assert len(list(module.parameters())) == 1  # scale
                 nn.init.constant_(module.scale, 1.0)
             elif isinstance(module, Attention):
-                assert len(list(module.parameters())) == 5  # to_q, to_k, to_v, to_o, for_pos_enc
+                assert len(list(module.parameters())) == 4  # to_q, to_kv, to_o, for_pos_enc
                 for p in module.parameters():
                     init_func(p)
             elif isinstance(module, nn.Linear):
