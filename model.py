@@ -390,7 +390,7 @@ class AttentionBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # we need this for weight initialization:
-        self.to_out = self.attention.to_o
+        self.to_out = [self.attention.to_o,]
 
     def forward(self, x_q, x_kv=None):
         # x_q: [L, ..., D]
@@ -415,7 +415,7 @@ class ChunkedCrossAttentionBlock(nn.Module):
         self.chunk_size = chunk_size
 
         # we need this for weight initialization:
-        self.to_out = self.attention.to_o
+        self.to_out = [self.attention.to_o,]
 
     def forward(self, x_q, x_kv):
         # x_q: [L, ..., D]
@@ -453,7 +453,7 @@ class FeedForwardBlock(nn.Module):
         )
 
         # we need this for weight initialization:
-        self.to_out = [m for m in self.mlp.modules() if isinstance(m, nn.Linear)][-1].weight
+        self.to_out = [[m for m in self.mlp.modules() if isinstance(m, nn.Linear)][-1].weight,]
 
     def forward(self, x):
         # x: [..., D]
@@ -695,7 +695,7 @@ class RetroLanguageModel(nn.Module):
         #   > by a factor of 1/√N where N is the # of residual layers.
         for subnet in [self.decoder, self.encoder]:
             for module in subnet.for_init:
-                module.to_out.data /= sqrt(len(subnet.for_init))
+                module.to_out[0].data /= sqrt(len(subnet.for_init))
 
     def forward(self, seq, labels=None):
 
