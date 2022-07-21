@@ -22,6 +22,8 @@ The potential benefits of RETRO:
  * Same performance as other transformer-based large language models, but with a much smaller
    model. The paper reports that a 7.5B parameter RETRO model is on par, and sometimes
    outperforms, strong models with 175B and 280B parameters (Jurrasic-1 and Gopher).
+   Smaller model means simpler and faster training.
+   The retrieval database requires large memory (RAM / SSD), but this is cheaper than GPU.
  * A given transformer model can be "Retrofitted". That is, the database and retrieval mechanisms
    can be added to a pretrained model, making the model into a RETRO model. The model is then
    fine-tuned by keeping the pretrained parameters frozen, and training only the new parameters.
@@ -38,10 +40,12 @@ The potential benefits of RETRO:
 2) Notes on this implementation
 -------------------------------
 This implementation is done in Python+PyTorch.
+
 The original RETRO implementation was not publicly released by DeepMind (as of the time of writing
 this).
 We tried to be very close to the RETRO paper, but some details in the paper are missing, so we
-needed to fill-in the blanks. Other minor differences are documented inline.
+needed to fill-in the blanks. See inline documentation.
+
 State tensor dimensions generally follow this order (skip items when not applicable):
 ("state tensors" - inputs to model or results of intermediate calculations, as opposed
   to parameter tensors;  dimensions order in `attention()` function is different)
@@ -64,13 +68,10 @@ in inline comments, we designate tensor sizes using this general rule:
   (different occurrences of D might designate different numbers. the idea is mostly to track
    different types of dimensions...)
 
-
-
 3) TODO
 -------
 * training loop, parallelization (maybe convert to Jax)
 * retrieval preprocessing and lookup
-* sampling word-by-word, with cached activations
 * retrofitting
 * make transformer model more flexible so that it's easy to retrofit different given models
 """
@@ -94,6 +95,8 @@ def chunkenize(x, chunk_size):
     length `24` and we use `chunk_size=4`, we will get a tensor with shape
     `[4,6,5]`, where the `6` is in the chunk index dimension, and `4` is in the
     within-chunk dimension.
+    return also the remainder of `x` that didn't fit into a full chunk.
+
     """
     t = len(x) - (len(x) % chunk_size)
     residue = x[t:]
@@ -147,9 +150,8 @@ def attention(q, k, v, mask=None, positional_encoding=None, additional_dim=None,
     if dont_have(positional_encoding):
         position_logits = 0.0
     else:
-        # as explained elsewhere in this source code, we use the relative positional
-        # encoding of transformerXL (https://arxiv.org/pdf/1901.02860.pdf), but without
-        # the bias terms.
+        # we use the relative positional encoding of transformerXL
+        # (https://arxiv.org/pdf/1901.02860.pdf), but without the bias terms.
         # from the RETRO paper:
         #   > Positional logits are obtained as a linear transform of a cosine vector
         #   > computed from (𝑑(𝑖,𝑖′))𝑖,𝑖′, and are added to content logits, as in a regular
