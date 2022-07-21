@@ -255,11 +255,13 @@ class Attention(nn.Module, ModuleWithCache):
             assert d_v * num_heads == d
         d_out = d
 
-        self.to_q = nn.Parameter(torch.randn(num_heads, d_qk, d_x_q))
-        self.to_k = nn.Parameter(torch.randn(num_heads, d_qk, d_x_kv))
-        self.to_v = nn.Parameter(torch.randn(num_heads, d_v, d_x_kv))
-        self.for_pos_enc = nn.Parameter(torch.randn(num_heads, d_qk, d_x_kv))
-        self.to_o = nn.Parameter(torch.randn(d_out, num_heads, d_v))
+        def parameter(*sz):
+            return nn.Parameter(torch.randn(*sz))
+
+        self.to_q = parameter(num_heads, d_qk, d_x_q)
+        self.to_kv = parameter(num_heads, d_qk + d_v, d_x_kv)
+        self.for_pos_enc = parameter(num_heads, d_qk, d_x_kv)
+        self.to_o = parameter(d_out, num_heads, d_v)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -353,8 +355,9 @@ class Attention(nn.Module, ModuleWithCache):
         q = torch.einsum('hdb,n...b->n...hd', self.to_q, x_q)  # [L, ..., H, D]
 
         if x_kv is not None:
-            k = torch.einsum('hdb,m...b->m...hd', self.to_k, x_kv)  # [L', ..., H, D]
-            v = torch.einsum('hdb,m...b->m...hd', self.to_v, x_kv)  # [L', ..., H, D']
+            kv = torch.einsum('hdb,m...b->m...hd', self.to_kv, x_kv)  # [L', ..., H, D+D']
+            k = kv[..., :self.d_qk]  # [L', ..., H, D]
+            v = kv[..., self.d_qk:]  # [L', ..., H, D']
         else:
             k = None
             v = None
@@ -417,7 +420,7 @@ class AttentionBlock(nn.Module, ModuleWithCache):
         self.dropout = nn.Dropout(dropout)
 
         # we need this for weight initialization:
-        self.to_out = self.attention.to_o
+        self.to_out = [self.attention.to_o, ]
 
         self.register_modules_with_cache(self.attention)
 
@@ -452,7 +455,7 @@ class ChunkedCrossAttentionBlock(nn.Module, ModuleWithCache):
         self.chunk_size = chunk_size
 
         # we need this for weight initialization:
-        self.to_out = self.attention.to_o
+        self.to_out = [self.attention.to_o, ]
 
         self.register_modules_with_cache(self.attention)
 
@@ -535,7 +538,7 @@ class FeedForwardBlock(nn.Module):
         )
 
         # we need this for weight initialization:
-        self.to_out = [m for m in self.mlp.modules() if isinstance(m, nn.Linear)][-1].weight
+        self.to_out = [[m for m in self.mlp.modules() if isinstance(m, nn.Linear)][-1].weight, ]
 
     def forward(self, x):
         # x: [..., D]
@@ -791,7 +794,7 @@ class RetroLanguageModel(nn.Module, ModuleWithCache):
                 assert len(list(module.parameters())) == 1  # scale
                 nn.init.constant_(module.scale, 1.0)
             elif isinstance(module, Attention):
-                assert len(list(module.parameters())) == 5  # to_q, to_k, to_v, to_o, for_pos_enc
+                assert len(list(module.parameters())) == 4  # to_q, to_kv, to_o, for_pos_enc
                 for p in module.parameters():
                     init_func(p)
             elif isinstance(module, nn.Linear):
@@ -810,7 +813,7 @@ class RetroLanguageModel(nn.Module, ModuleWithCache):
         #   > by a factor of 1/√N where N is the # of residual layers.
         for subnet in [self.decoder, self.encoder]:
             for module in subnet.for_init:
-                module.to_out.data /= sqrt(len(subnet.for_init))
+                module.to_out[0].data /= sqrt(len(subnet.for_init))
 
     def forward(self, seq, labels=None):
 
