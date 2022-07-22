@@ -1,3 +1,8 @@
+"""
+here we verify:
+    * model is autoregressive/causal
+    * model's cache works
+"""
 import torch
 from model import RetroLanguageModel
 
@@ -32,7 +37,7 @@ out, _ = model.forward(seq)
 assert out.shape == (len(out), batch_size, vocab_size)
 
 ## test autoregressivity
-for r in [1,2,3,4,5,6]:
+for r in range(1,11):
 
     out1, _ = model.forward(seq[:-r])
     out2 = model.forward(seq)[0][:-r]

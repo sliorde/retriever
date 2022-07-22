@@ -7,34 +7,29 @@ Contents
 2) Notes on this implementation
 3) TODOs
 
-
 1) RETRO overview
 -----------------
-
-RETRO is a transformer-based autoregressive language model, which uses a much smaller transformer
-(i.e. less parameters) compared to alternatives, while achieving comparable performance.
-RETRO does this by augmenting the model with a large database of examples from the training data.
-During training and inference, RETRO retrieves items from the database based on their similarity
-to its input, and incorporates the retrieved items into the forward pass through a cross-attention
-mechanism.
+RETRO is a transformer-based autoregressive language model, which uses a much smaller transformer (i.e. less parameters)
+compared to alternatives, while achieving comparable performance. RETRO does this by augmenting the model with a large
+database of examples from the training data.
+During training and inference, RETRO retrieves items from the database based on their similarity to its input, and
+incorporates the retrieved items into the forward pass through a cross-attention mechanism.
 
 The potential benefits of RETRO:
- * Same performance as other transformer-based large language models, but with a much smaller
-   model. The paper reports that a 7.5B parameter RETRO model is on par, and sometimes
-   outperforms, strong models with 175B and 280B parameters (Jurrasic-1 and Gopher).
-   Smaller model means simpler and faster training.
-   The retrieval database requires large memory (RAM / SSD), but this is cheaper than GPU.
- * A given transformer model can be "Retrofitted". That is, the database and retrieval mechanisms
-   can be added to a pretrained model, making the model into a RETRO model. The model is then
-   fine-tuned by keeping the pretrained parameters frozen, and training only the new parameters.
-   This scheme increases the model's parameter count by less than 10%, and the training is very
-   quick. The fine-tuned RETRO model has performance much better than the pretrained model, and
-   performs almost as well as a RETRO model trained from scratch.
- * A trained RETRO model can be easily updated to different contexts or tasks simply by updating
-   the retrieval database, without needing to change the model's parameters.
- * Adding items to the retrieval database, without modifying the trained RETRO model, improves
-   the performance. This means that a model can be improved ("learn new knowledge") simply by
-   collecting more data and without needing to retrain.
+ * Same performance as other transformer-based large language models, but with a much smaller model. The paper reports
+   that a 7.5B parameter RETRO model is on par, and sometimes outperforms, strong models with 175B and 280B parameters
+   (Jurrasic-1 and Gopher). Smaller model means simpler and faster training. The retrieval database requires large
+   memory (RAM / SSD), but this is cheaper than GPU.
+ * A given transformer model can be "Retrofitted". That is, the database and retrieval mechanisms can be added to a
+   pretrained model, making the model into a RETRO model. The model is then fine-tuned by keeping the pretrained
+   parameters frozen, and training only the new parameters. This scheme increases the model's parameter count by less
+   than 10%, and the training is very quick. The fine-tuned RETRO model has performance much better than the pretrained
+   model, and performs almost as well as a RETRO model trained from scratch.
+ * A trained RETRO model can be easily updated to different contexts or tasks simply by updating the retrieval database,
+   without needing to change the model's parameters.
+ * Adding items to the retrieval database, without modifying the trained RETRO model, improves the performance. This
+   means that a model can be improved ("learn new knowledge") simply by collecting more data and without needing to
+   retrain.
 
 
 2) Notes on this implementation
@@ -44,11 +39,12 @@ This implementation is done in Python+PyTorch.
 The original RETRO implementation was not publicly released by DeepMind (as of the time of writing
 this).
 We tried to be very close to the RETRO paper, but some details in the paper are missing, so we
-needed to fill-in the blanks. See inline documentation.
+needed to fill-in the blanks. This includes things like: exact recipe of relative encoding; where is dropout used?;
+parameters of the RMS normalization; are biases used in MLP layers? weight initialization; and more.
 
 State tensor dimensions generally follow this order (skip items when not applicable):
-("state tensors" - inputs to model or results of intermediate calculations, as opposed
-  to parameter tensors;  dimensions order in `attention()` function is different)
+("state tensors" - inputs to model or results of intermediate calculations, as opposed to parameter tensors; dimensions
+order in `attention()` function is different)
  0) sequence dimension (also when the tensor is chunked)
  1) neighbor index
  2) chunk index
@@ -65,13 +61,15 @@ in inline comments, we designate tensor sizes using this general rule:
   D' = generic dimension size
   V = vocabulary size
   batch dimension is hidden behind ellipsis (...)
-  (different occurrences of D might designate different numbers. the idea is mostly to track
-   different types of dimensions...)
+  (different occurrences of D might designate different numbers. the idea is mostly to track different types of
+  dimensions...)
+
 
 3) TODO
 -------
-* training loop, parallelization (maybe convert to Jax)
-* retrieval preprocessing and lookup
+* training loop, parallelization (maybe convert to Jax).
+* retrieval preprocessing and lookup.
+* sampling, greedy sampling, beam search.
 * retrofitting
 * make transformer model more flexible so that it's easy to retrofit different given models
 """
@@ -96,7 +94,6 @@ def chunkenize(x, chunk_size):
     `[4,6,5]`, where the `6` is in the chunk index dimension, and `4` is in the
     within-chunk dimension.
     return also the remainder of `x` that didn't fit into a full chunk.
-
     """
     t = len(x) - (len(x) % chunk_size)
     residue = x[t:]
@@ -104,7 +101,8 @@ def chunkenize(x, chunk_size):
     if len(x) == 0:
         chunked = None
     else:
-        chunked = torch.reshape(x, (-1, chunk_size, *x.shape[1:])).transpose(0, 1)
+        chunked = torch.reshape(x, (-1, chunk_size, *x.shape[1:])) \
+            .transpose(0, 1)
     if len(residue) == 0:
         residue = None
     return chunked, residue
@@ -117,13 +115,16 @@ def unchunk(x):
     return torch.reshape(x.transpose(0, 1), (-1, *x.shape[2:]))
 
 
-def attention(q, k, v, mask=None, positional_encoding=None, additional_dim=None, dropout=None,
-              rescale_logits=False):
+def attention(q, k, v, mask=None, positional_encoding=None, additional_dim=None,
+              dropout=None, rescale_logits=False):
     """
     attention operation.
 
     this function is implemented to allow a more general attention than required for RETRO:
     it works also without positional embedding, and the batch dimensions can be of any shape.
+
+    this function is quite flexible with respect to various forms of "batch" dimensions: it works also in the presence
+    of neighbors, chunks, etc.
 
     in einsum strings, these are the meaning of index names:
      d : vector dimensions
@@ -136,10 +137,9 @@ def attention(q, k, v, mask=None, positional_encoding=None, additional_dim=None,
     q: query sequence of length L, for each head
     k: key sequence of length L', for each head
     v: value sequence of length L', for each head
-    mask: (optional) boolean mask of size L-by-L', `True` indicates that a position is masked.
-        used for causal masking.
-    positional_encoding: (optional) tensor that will be multiplied by the queries and then
-        added to the logits (pre-softmax), used for relative positional encoding.
+    mask: (optional) boolean mask of size L-by-L', `True` indicates that a position is masked. used for causal masking.
+    positional_encoding: (optional) tensor that will be multiplied by the queries and then added to the logits
+      (pre-softmax), used for relative positional encoding.
     additional_dim:
     dropout:
     rescale_logits:
@@ -150,31 +150,33 @@ def attention(q, k, v, mask=None, positional_encoding=None, additional_dim=None,
     if dont_have(positional_encoding):
         position_logits = 0.0
     else:
-        # we use the relative positional encoding of transformerXL
-        # (https://arxiv.org/pdf/1901.02860.pdf), but without the bias terms.
+        # we use the relative positional encoding of transformerXL (https://arxiv.org/pdf/1901.02860.pdf),
+        # but without the bias terms.
         # from the RETRO paper:
-        #   > Positional logits are obtained as a linear transform of a cosine vector
-        #   > computed from (𝑑(𝑖,𝑖′))𝑖,𝑖′, and are added to content logits, as in a regular
-        #   > self-attention block.
-        # This sentence makes it seem as if they don't use the bias terms (but it's not
-        # 100% clear).
-        position_logits = torch.einsum('n...hd,nmhd->nm...h', q, positional_encoding)
+        #   > Positional logits are obtained as a linear transform of a cosine vector computed from (𝑑(𝑖,𝑖′))𝑖,𝑖′,
+        #   > and are added to content logits, as in a regular self-attention block.
+        # This sentence makes it seem as if they don't use the bias terms (but I may
+        # be wrong...).
+        position_logits = torch.einsum('n...hd,nmhd->nm...h', q,
+                                       positional_encoding)
 
-        # this is required for the case of chunked-cross attention, where content logit contain
-        # an additional neighbor dimension
+        # this is required for the case of chunked-cross attention, where content logit contain an additional neighbor
+        # dimension
         if have(additional_dim):
             position_logits.unsqueeze_(additional_dim)
 
     logits = content_logits + position_logits
 
     if rescale_logits:
-        # scale the logits, as in the original attention paper. we add this, even though
-        # it's not clear if it is used in RETRO. In the RETRO paper, equation (4) and
-        # listing 1, it does not appear.
+        # scale the logits, as in the original attention paper. we add this, even though it's not clear if it is used in
+        # RETRO. In the RETRO paper, equation (4) and listing 1, it does not appear.
         logits /= sqrt(q.size(-1))
 
     if have(mask):
-        logits.masked_fill_(mask[(slice(None), slice(None), *(None,) * (logits.ndim - 2))],
+        logits.masked_fill_(mask[
+                                (slice(None),
+                                 slice(None),
+                                 *(None,) * (logits.ndim - 2))],
                             float('-inf'))
 
     if have(additional_dim):
@@ -193,8 +195,8 @@ def attention(q, k, v, mask=None, positional_encoding=None, additional_dim=None,
 
 class RMSNorm(nn.Module):
     """
-    RMSNorm has some configurations not implemented here. It's not clear from the
-    RETRO paper which configuration is used, so here we implement the simplest form.
+    RMSNorm has some configurations not implemented here. It's not clear from the RETRO paper which configuration is
+    used, so here we implement the simplest form.
     """
 
     def __init__(self, d, eps=1e-8, device=None, dtype=None):
@@ -224,8 +226,9 @@ class Attention(nn.Module, ModuleWithCache):
     sincos_cache = dict()
     mask_cache = dict()
 
-    def __init__(self, d, d_x_q=None, d_x_kv=None, d_qk=None, d_v=None, num_heads=1,
-                 causal=False, offset=0, additional_dim=None, dropout=0.0, use_kv_cache=False, use_offset_cache=False):
+    def __init__(self, d, d_x_q=None, d_x_kv=None, d_qk=None, d_v=None,
+                 num_heads=1, causal=False, offset=0, additional_dim=None,
+                 dropout=0.0, use_kv_cache=False, use_offset_cache=False):
         """
 
         Parameters
@@ -240,6 +243,10 @@ class Attention(nn.Module, ModuleWithCache):
         offset: offset between query and key positions, for relative positional encoding
         additional_dim:
         dropout:
+        use_kv_cache: whether to save keys and values in cache for later usage (won't save to cache if module's cache is
+            disabled)
+        use_offset_cache: whether to track total query sequence length in cache (won't trach if module's cache is
+        disabled)
         """
         nn.Module.__init__(self)
         ModuleWithCache.__init__(self)
@@ -280,6 +287,10 @@ class Attention(nn.Module, ModuleWithCache):
         self.use_offset_cache = use_offset_cache
 
     def get_causal_mask(self, sz_q, sz_k, offset, device):
+        """
+        return boolean mask which is `True` in position (i,j) if the query at position i should not attend to the key at
+        position j (because j is in i's future). allows setting the position offset between queries and keys.
+        """
 
         # first, check if mask is already in cache
         key = (sz_q, sz_k, offset)
@@ -288,7 +299,8 @@ class Attention(nn.Module, ModuleWithCache):
 
         # otherwise, create mask
         else:
-            mask = torch.ones(sz_q, sz_k, device=device, dtype=torch.bool).triu(1 + offset)
+            mask = torch.ones(sz_q, sz_k, device=device, dtype=torch.bool) \
+                .triu(1 + offset)
 
             # put in cache, and evict cache if it's too large
             self.mask_cache[key] = mask
@@ -298,16 +310,17 @@ class Attention(nn.Module, ModuleWithCache):
         return mask  # [sz_q, sz_k]
 
     def get_pos_enc(self, sz_q, sz_k, offset, device):
-        # TODO: for training, we cache `sincos`, which is the position encoding before
-        #  applying the linear transform, because the transform is trainable and changes
-        #  between batches.
-        #  but for eval, we might as well cache the result of the transform.
-        #  (however, we need to be careful about this, since what if we put model on eval mode
-        #  temporarily, or we modify the model's weights while in eval?...)
-        #
-        # TODO: we use relative encoding of TransformerXL, but without the bias terms. This
-        #  is what I think is implied  by the retro paper, but it's not defined explicitly.
-        #  see comment in function `attention()`
+        """
+        relative positional encoding as in transformerXL (https://arxiv.org/pdf/1901.02860.pdf), but without bias term
+        for now. (see also  inline comment in function `attention()`)
+
+        TODO: for training, we cache `sincos`, which is the position encoding before
+         applying the linear transform, because the transform is trainable and changes
+         between batches.
+         but for eval, we might as well cache the result of the transform.
+         (however, we need to be careful about this, since what if we put model on eval mode
+         temporarily, or we modify the model's weights while in eval?...)
+        """
 
         # first, check if `sincos`` is already in cache
         key = (sz_q, sz_k, offset, self.d_x_kv)
@@ -316,10 +329,8 @@ class Attention(nn.Module, ModuleWithCache):
             sincos = sincos.to(device)  # [sz_q+sz_k-1, d_x_kv]
             dists = dists.to(device)  # [sz_q, sz_k]
 
-        # otherwise, create `sincos`, as in TransformerXL (which is the same as in
-        # the paper Attention is All You Need).
+        # otherwise, create `sincos`, as in TransformerXL (which is the same as in the paper Attention is All You Need).
         else:
-
             # signed distance between each query position and each key position
             dists = torch.arange(sz_q, device=device)[:, None] - \
                     torch.arange(sz_k, device=device)[None, :] + offset  # [sz_q, sz_k]
@@ -328,8 +339,9 @@ class Attention(nn.Module, ModuleWithCache):
             r = torch.arange(dists.min(), dists.max() + 1.0, 1.0, device=device)  # [sz_q+sz_k-1]
 
             # inverse of frequencies for sinusoid positional encoding
-            inv_freq = 1 / (10000 ** (torch.arange(0.0, self.d_x_kv, 2.0, device=device) /
-                                      self.d_x_kv))  # [d_x_kv/2]
+            inv_freq = 1 / (10000 **
+                            (torch.arange(0.0, self.d_x_kv, 2.0, device=device)
+                             / self.d_x_kv))  # [d_x_kv/2]
 
             # input to sine and cosine functions
             phases = r[:, None] * (inv_freq[None, :])  # [sz_q+sz_k-1, d_x_kv/2]
@@ -346,8 +358,7 @@ class Attention(nn.Module, ModuleWithCache):
         pos_enc = torch.einsum('hdb,nb->nhd', self.for_pos_enc,
                                self.dropout(sincos))  # [sz_q+sz_k-1, h, d_qk]
 
-        # reshape so that `pos_enc[i,j]` will reflect relative position of query `i` and
-        # key 'j'.
+        # reshape so that `pos_enc[i,j]` will reflect relative position of query `i` and key 'j'.
         pos_enc = pos_enc[dists - dists.min()]  # [sz_q, sz_k, h, d_qk]
         return pos_enc  # [sz_q, sz_k, h, d_qk]
 
@@ -355,8 +366,10 @@ class Attention(nn.Module, ModuleWithCache):
         # x_q: [L, ..., D]
         # x_kv: [L', ..., D']
 
+        # query
         q = torch.einsum('hdb,n...b->n...hd', self.to_q, x_q)  # [L, ..., H, D]
 
+        # key and value. it might be the case that they were not given, but that they appear in the cache.
         if have(x_kv):
             kv = torch.einsum('hdb,m...b->m...hd', self.to_kv, x_kv)  # [L', ..., H, D+D']
             k = kv[..., :self.d_qk]  # [L', ..., H, D]
@@ -365,16 +378,19 @@ class Attention(nn.Module, ModuleWithCache):
             k = None
             v = None
 
-        offset_fix = 0
+        offset_fix = 0  # if we call this function sequentially while sampling a sequence, we want to track in cache
+        # the position in the sequence so that we can calculate positional encoding properly
         if self.use_kv_cache:
             kv_cache = self.get_from_cache('kv')
             if have(kv_cache):
                 k_cache, v_cache = kv_cache
 
                 if dont_have(k):
+                    # keys and values came from cache only
                     k = k_cache.to(q.device)
                     v = v_cache.to(q.device)
                 else:
+                    # combine given keys and values with the cached ones.
                     k = torch.cat((k_cache.to(k.device), k))
                     v = torch.cat((v_cache.to(v.device), v))
 
@@ -390,19 +406,21 @@ class Attention(nn.Module, ModuleWithCache):
                 offset_fix = offset_fix_cache
                 self.update_cache(offset_fix + len(q), 'offset_fix')
 
-        if dont_have(k):
-            return torch.zeros(*x_q.shape[:-1], self.d_out, device=self.to_o.device, dtype=self.to_o.dtype)
+        # if dont_have(k):
+        #     return torch.zeros(*x_q.shape[:-1], self.d_out, device=self.to_o.device, dtype=self.to_o.dtype)
 
         n, m = len(q), len(k)
 
         if self.causal:
-            mask = self.get_causal_mask(n, m, self.offset + offset_fix, q.device)  # [L, L']
+            mask = self.get_causal_mask(n, m, self.offset + offset_fix,
+                                        q.device)  # [L, L']
         else:
             mask = None
 
         pos_enc = self.get_pos_enc(n, m, self.offset + offset_fix, q.device)  # [L, L', H, D]
 
-        attn = attention(q, k, v, mask, pos_enc, self.additional_dim, self.dropout)  # [L, ..., H, D]
+        attn = attention(q, k, v, mask, pos_enc, self.additional_dim,
+                         self.dropout)  # [L, ..., H, D]
 
         out = torch.einsum('dhb,n...hb->n...d', self.to_o, attn)  # [L, ..., D]
 
@@ -415,15 +433,18 @@ class AttentionBlock(nn.Module, ModuleWithCache):
     can be used for both self- and cross- attention.
     """
 
-    def __init__(self, d, d_kv=None, num_heads=1, causal=False, dropout=0.0, use_kv_cache=False):
+    def __init__(self, d, d_kv=None, num_heads=1, causal=False, dropout=0.0,
+                 use_kv_cache=False):
         nn.Module.__init__(self)
         ModuleWithCache.__init__(self)
 
         if dont_have(d_kv):
             d_kv = d
         self.norm = RMSNorm(d)
-        self.attention = Attention(d, d_x_kv=d_kv, num_heads=num_heads, causal=causal,
-                                   dropout=dropout, use_kv_cache=use_kv_cache, use_offset_cache=use_kv_cache)
+        self.attention = Attention(d, d_x_kv=d_kv, num_heads=num_heads,
+                                   causal=causal, dropout=dropout,
+                                   use_kv_cache=use_kv_cache,
+                                   use_offset_cache=use_kv_cache)
         self.dropout = nn.Dropout(dropout)
 
         # we need this for weight initialization:
@@ -446,6 +467,13 @@ class AttentionBlock(nn.Module, ModuleWithCache):
 class ChunkedCrossAttentionBlock(nn.Module, ModuleWithCache):
     """
     residual chunked cross attention with normalization.
+    this module operates on query chunks and corresponding key-value chunks.
+    attention happens only between corresponding chunks, never across chunks (in particular, a query chunk does not
+    attend earlier chunks beyond the one it attends to).
+    key-value chunks include multiple chunks, as the number of neighbors used when retrieving.
+    to maintain causality, the correspondence between query chunks and key-value chunks is as following:
+    a query chunk attends key-values obtained from retrieved neighbors of a chunk whose latest position is the first
+    position of this query chunk.
     """
 
     def __init__(self, chunk_size, d, d_kv, num_heads=1, dropout=0.0):
@@ -455,8 +483,9 @@ class ChunkedCrossAttentionBlock(nn.Module, ModuleWithCache):
         if dont_have(d_kv):
             d_kv = d
         self.norm = RMSNorm(d)
-        self.attention = Attention(d, d_x_kv=d_kv, num_heads=num_heads, offset=chunk_size - 1,
-                                   additional_dim=2, use_kv_cache=True, use_offset_cache=False)
+        self.attention = Attention(
+            d, d_x_kv=d_kv, num_heads=num_heads, offset=chunk_size - 1,
+            additional_dim=2, use_kv_cache=True, use_offset_cache=False)
         self.dropout = nn.Dropout(dropout)
 
         self.chunk_size = chunk_size
@@ -468,13 +497,28 @@ class ChunkedCrossAttentionBlock(nn.Module, ModuleWithCache):
 
     @staticmethod
     def get_stuff(pos, length, chunk_size):
+        """
+        calculate various numbers needed for the forward pass
+        """
+
+        # the first elements of an input sequence will never be used in this cross attention, because they don't have
+        # neighbors yet (their neighbors can only be retrieved after seeing a full chunk of input). thus, we omit them.
         num_elements_to_omit = min(max(0, chunk_size - 1 - pos), length)
         num_elements_to_keep = length - num_elements_to_omit
-        len_x_q_padded = chunk_size * (((pos + length) // chunk_size) - (max(0, pos - (chunk_size - 1)) // chunk_size))
-        # len_x_q_padded = ((num_elements_to_keep + chunk_size - 1) // chunk_size) * chunk_size
+
+        # even if the input query is smaller than a chunk, we will create chunk-sized inputs to the attention, and
+        # pad with zeros. this is the length of the padded sequence.
+        len_x_q_padded = chunk_size * \
+                         (((pos + length) // chunk_size) -
+                          (max(0, pos - (chunk_size - 1)) // chunk_size))
+
+        # first item index to be used from query sequence
         ind1_x_q = num_elements_to_omit
+
+        # in which locations (initial,final) of the padded sequence to put the queries?
         ind1_x_q_padded = (num_elements_to_omit + pos + 1) % chunk_size
         ind2_x_q_padded = ind1_x_q_padded + num_elements_to_keep
+
         ind1_z_padded = ind1_x_q
         ind2_z_padded = ind1_z_padded + num_elements_to_keep
 
@@ -490,13 +534,12 @@ class ChunkedCrossAttentionBlock(nn.Module, ModuleWithCache):
         # x_q: [L, ..., D]
         # x_kv: [C', N, L//C, ..., D']
         # `x_kv` is already chunked, but the sequence `x_q` is not.
-        # `x_q` and `x_kv` are aligned, meaning that they share a position axis without an
-        # offset.
-        # we partition the sequence `x_q` into chunks.
-        # when chunking, we make sure that no `x_q` element can attend a future chunk,
-        # otherwise we would break causality.
-        # see explanation in RETRO paper.
+        # `x_q` and `x_kv` are aligned, meaning that they share a position axis without an offset.
+        # we partition the sequence `x_q` into chunks. when chunking, we make sure that no `x_q` element can attend
+        # a future chunk, otherwise we would break causality. see explanation in RETRO paper.
 
+        # position of first index in `x_q`. the default is 0, but might be different if we are sequentially calling this
+        # function while using a cache to track position.
         pos = 0
         pos_cached = self.get_from_cache('pos')
         if have(pos_cached):
@@ -508,25 +551,42 @@ class ChunkedCrossAttentionBlock(nn.Module, ModuleWithCache):
 
         chunk_size = self.chunk_size
 
-        len_x_q_padded, ind1_x_q, ind1_x_q_padded, \
-        ind2_x_q_padded, ind1_z_padded, ind2_z_padded = self.get_stuff(pos, len(x_q), chunk_size)
+        len_x_q_padded, ind1_x_q, ind1_x_q_padded, ind2_x_q_padded, \
+        ind1_z_padded, ind2_z_padded = self.get_stuff(pos, len(x_q), chunk_size)
 
-        x_q_padded = torch.zeros((len_x_q_padded, *x_q.shape[1:]), device=x_q.device, dtype=x_q.dtype)
+        # this is a generalization of the padding done in the RETRO paper, listing 1. it is more general because it
+        # works also for sequences of any length with any initial position.
+        x_q_padded = torch.zeros((len_x_q_padded, *x_q.shape[1:]),
+                                 device=x_q.device, dtype=x_q.dtype)
         x_q_padded[ind1_x_q_padded:ind2_x_q_padded] = x_q[ind1_x_q:]
+
         x_q_chunked, _ = chunkenize(x_q_padded, chunk_size)  # [C, L//C, ..., D]
+
+        # this condition might happen if we were given a query sequence shorter than a chunk, so after chunking we are
+        # left with nothing. in this case, we return x_q, as if no cross-attention was used.
         if dont_have(x_q_chunked):
             return x_q
+
         z_chunked = self.attention(x_q_chunked, x_kv)  # [C, L//C , ..., D]
+
+        # for cache, we only need to keep the keys and values from the last
+        # unconsumed chunk. we throw out older keys and values. if the last
+        # chunk was consumed, we put `None` in the cache.
         if (pos + len(x_q) + 1) % chunk_size == 0:
             self.attention.update_cache(None, 'kv')
         else:
             kv_cache = self.attention.get_from_cache('kv')
             if have(kv_cache):
                 slc = (slice(None), slice(None), slice(-1, None), ...)
-                self.attention.update_cache((kv_cache[0][slc], kv_cache[1][slc]), 'kv')
+                self.attention.update_cache(
+                    (kv_cache[0][slc], kv_cache[1][slc]), 'kv')
+
+        # this is again a generalization of the padding done in the RETRO paper, listing 1.
         z = unchunk(z_chunked)
         z_padded = torch.zeros_like(x_q)
-        z_padded[ind1_z_padded:ind2_z_padded] = z[ind1_x_q_padded:ind2_x_q_padded]
+        z_padded[ind1_z_padded:ind2_z_padded] = \
+            z[ind1_x_q_padded:ind2_x_q_padded]
+
         return x_q + self.dropout(z_padded)  # [L, ..., D]
 
 
@@ -556,8 +616,7 @@ class FeedForwardBlock(nn.Module):
 
 class Retriever(ModuleWithCache):
     """
-    currently, this is a dummy retriever. later we will implement a retriever based
-    on BERT and approximate-KNN
+    currently, this is a dummy retriever. later we will implement a retriever based on BERT and approximated-KNN
     """
 
     def __init__(
@@ -579,12 +638,17 @@ class Retriever(ModuleWithCache):
         temporary dummy function that maintains causality
         """
         # seq [L, ...]
+
+        # if a sequence is smaller than a chunk size, or has a residual after dividing by the chunk size, we save in
+        # cache the partial chunk, for the case of sequential sampling.
         last_partial_chunk = self.get_from_cache('last_partial_chunk')
         if have(last_partial_chunk):
             seq = torch.cat((last_partial_chunk.to(seq.device), seq))
 
         seq_chunked, last_partial_chunk = chunkenize(seq, self.chunk_size)  # [C, L//C, ...]
 
+        # the random number generator is set so that consistent retrievals are created across different
+        # sequential invocations of this dummy retriever.
         rng = torch.Generator(device=seq.device).manual_seed(29847892371)
         rng_state = self.get_from_cache('rng_state')
         if have(rng_state):
@@ -630,17 +694,20 @@ class Encoder(nn.Module, ModuleWithCache):
         self.dropout = nn.Dropout(dropout)
 
         # self-attention blocks
-        self.sa = nn.ModuleList([AttentionBlock(d, num_heads=num_heads, dropout=dropout)
-                                 for _ in range(num_layers)])
+        self.sa = nn.ModuleList([
+            AttentionBlock(d, num_heads=num_heads, dropout=dropout)
+            for _ in range(num_layers)])
 
         # cross-attention blocks
-        self.ca = nn.ModuleList(
-            [AttentionBlock(d, d_dec, num_heads=num_heads, dropout=dropout) if i in ca_layers
-             else None for i in range(num_layers)])
+        self.ca = nn.ModuleList([
+            AttentionBlock(d, d_dec, num_heads=num_heads, dropout=dropout)
+            if i in ca_layers else None
+            for i in range(num_layers)])
 
         # feed-forward blocks
-        self.ff = nn.ModuleList([FeedForwardBlock(d, d_ff, dropout=dropout)
-                                 for _ in range(num_layers)])
+        self.ff = nn.ModuleList([
+            FeedForwardBlock(d, d_ff, dropout=dropout)
+            for _ in range(num_layers)])
 
         # normalization
         self.norm = RMSNorm(d)
@@ -656,11 +723,18 @@ class Encoder(nn.Module, ModuleWithCache):
         y: [C', N, L//C, ..., D']
         x: [L, ..., D]
         """
+
+        # if a sequence is smaller than a chunk size, or has a residual after dividing by the chunk size, we save in
+        # cache the partial chunk, for the case of sequential sampling.
         last_partial_x_chunk = self.get_from_cache('last_partial_x_chunk')
         if have(last_partial_x_chunk):
             x = torch.cat((last_partial_x_chunk.to(x.device), x))
+
         x_chunked, last_partial_x_chunk = chunkenize(x, self.chunk_size)  # [C, L//C, ..., D]
         self.update_cache(last_partial_x_chunk, 'last_partial_x_chunk')
+
+        # this condition will hold in case that we haven't gathered enough input sequence elements to get a new
+        # retrieval
         if dont_have(y):
             return None
         else:
@@ -695,27 +769,33 @@ class Decoder(nn.Module, ModuleWithCache):
             return (i >= ca_start) and ((i - ca_start) % ca_freq == 0)
 
         # self-attention blocks
-        self.sa = nn.ModuleList(
-            [AttentionBlock(d, num_heads=num_heads, causal=True, dropout=dropout, use_kv_cache=True)
-             for _ in range(num_layers)])
+        self.sa = nn.ModuleList([
+            AttentionBlock(d, num_heads=num_heads, causal=True, dropout=dropout,
+                           use_kv_cache=True)
+            for _ in range(num_layers)])
 
         # cross-attention blocks
-        self.ca = nn.ModuleList(
-            [ChunkedCrossAttentionBlock(chunk_size, d, d_enc, num_heads=num_heads, dropout=dropout)
-             if use_cross(i) else None for i in range(num_layers)])
+        self.ca = nn.ModuleList([
+            ChunkedCrossAttentionBlock(chunk_size, d, d_enc,
+                                       num_heads=num_heads, dropout=dropout)
+            if use_cross(i) else None
+            for i in range(num_layers)])
 
         # feed-forward blocks
-        self.ff = nn.ModuleList([FeedForwardBlock(d, d_ff, dropout=dropout)
-                                 for _ in range(num_layers)])
+        self.ff = nn.ModuleList([
+            FeedForwardBlock(d, d_ff, dropout=dropout)
+            for _ in range(num_layers)])
 
         # normalization
-        self.for_enc_norm = RMSNorm(d)
+        self.for_enc_norm = RMSNorm(d)  # typically, a transformer decoder/encoder applies normalization after all its
+        # blocks, i.e before emitting the output. in our case, the decoder emits an
+        # intermediate calculation to the encoder. therefore, we apply the normalization
+        # on it as well.
         self.norm = RMSNorm(d)
 
         self.chunk_size = chunk_size
 
-        # we will use this for weight initialization of the final projection of each
-        # attention/ff layer
+        # we will use this for weight initialization of the final projection of each attention/ff layer
         self.for_init = [m for m in chain(self.sa, self.ca, self.ff) if have(m)]
 
         self.register_modules_with_cache(list(self.sa + self.ca))
@@ -768,21 +848,30 @@ class RetroLanguageModel(nn.Module, ModuleWithCache):
 
         assert (not share_embeddings) or (d_enc == d_dec)
 
-        self.retriever = Retriever(vocab_size, chunk_size, continuation_length, num_neighbors)
+        self.retriever = Retriever(vocab_size, chunk_size, continuation_length,
+                                   num_neighbors)
+
         self.embedding_dec = nn.Embedding(vocab_size, d_dec)
-        self.embedding_enc = nn.Embedding(vocab_size, d_enc) if not share_embeddings \
+        self.embedding_enc = nn.Embedding(vocab_size, d_enc) \
+            if not share_embeddings \
             else partial(self.embedding_dec)
-        self.encoder = Encoder(num_layers_enc, d_enc, d_ff_enc, d_dec, num_heads_enc,
-                               ca_layers_enc, chunk_size, dropout)
-        encoder = partial(self.encoder)
-        self.decoder = Decoder(num_layers_dec, d_dec, d_ff_dec, d_enc, num_heads_dec,
-                               ca_start_dec, ca_freq_dec, chunk_size, encoder, dropout)
+
+        self.encoder = Encoder(num_layers_enc, d_enc, d_ff_enc, d_dec,
+                               num_heads_enc, ca_layers_enc, chunk_size,
+                               dropout)
+        encoder = partial(self.encoder)  # we pass this partial to the decoder, instead of passing the encoder
+        # directly, because we don't want the encoder to count as a child module of the
+        # decoder.
+
+        self.decoder = Decoder(num_layers_dec, d_dec, d_ff_dec, d_enc,
+                               num_heads_dec, ca_start_dec, ca_freq_dec,
+                               chunk_size, encoder, dropout)
+
         self.to_vocab = nn.Linear(d_dec, vocab_size)
+
         self.dropout = nn.Dropout(dropout)
 
         self.register_modules_with_cache([self.retriever, self.decoder, self.encoder])
-
-        self.chunk_size = chunk_size
 
         self.reset_parameters()
 
@@ -823,16 +912,17 @@ class RetroLanguageModel(nn.Module, ModuleWithCache):
         self.apply(init)
 
         # from GPT2 paper::
-        #   > A modified initialization which accounts for the accumulation on the residual
-        #   > path with model depth. We scale the weights of residual layers at initialization
-        #   > by a factor of 1/√N where N is the # of residual layers.
+        #   > A modified initialization which accounts for the accumulation on the residual path with model depth. We
+        #   > scale the weights of residual layers at initialization by a factor of 1/√N where N is the # of residual
+        #   > layers.
         for subnet in [self.decoder, self.encoder]:
             for module in subnet.for_init:
                 module.to_out[0].data /= sqrt(len(subnet.for_init))
 
     def forward(self, seq, labels=None):
 
-        # retrieve neighbors from database, for each chunk in `seq`
+        # retrieve neighbors from database, for each chunk in `seq`. this might be `None` if `seq` is shorter than a
+        # chunk.
         retrieved = self.retriever(seq)  # [C', N, L//C, ...]
 
         # convert tokens to embeddings
@@ -845,6 +935,7 @@ class RetroLanguageModel(nn.Module, ModuleWithCache):
         # apply decoder and language model head
         dec_out = self.decoder(x, y)  # [L, ..., D]
 
+        # get logits per position (and batch element) over all vocabulary items.
         logits = self.to_vocab(dec_out)  # [L, ..., V]
 
         # calculate and return loss if labels were given
