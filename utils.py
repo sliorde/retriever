@@ -12,6 +12,9 @@ def dont_have(x):
 
 
 def get(obj, *k):
+    """
+    get object from nested object (list/tuple/dict) using a multi-level key, and return `None` if can't.
+    """
     if len(k) == 1:
         k = k[0]
         if obj is None:
@@ -28,6 +31,10 @@ def get(obj, *k):
 
 
 def sett(obj, value, *k):
+    """
+    sets the value of a nested object (list/tuple/dict), using a multi-level key,
+    creating object down the hierarchy as needed.
+    """
     next_obj = get(obj, k[0])
     if dont_have(next_obj) or not isinstance(next_obj, (dict, list)):
         if isinstance(obj, list):
@@ -47,30 +54,21 @@ def sett(obj, value, *k):
             sett(obj[k[0]], value, *k[1:])
 
 
-def update_cache(return_cache, cache, obj, *k):
-    if return_cache:
-        sett(cache, obj, *k)
-
-
-def call_and_cache(func, args, return_cache, cache, *k):
-    out = func(*args, get(cache, *k), return_cache)
-    update_cache(return_cache, cache, out[-1], *k)
-    return out[:-1]
-
-
-def maybe_reset_cache(return_cache, cache):
-    if (dont_have(cache)) and return_cache:
-        cache = dict()
-    return cache
-
-
-def maybe_drop_cache(return_cache, cache):
-    if not return_cache:
-        cache = None
-    return cache
-
-
 class ModuleWithCache:
+    """
+    an attempt to create a template for objects (especially torch nn.Modules, especially transformers...)
+    that require caching, e.g. for sequential autoregressive sampling. it allows caching intermediate
+    calculation results (such as attention keys and values), so that they can be quickly reused for the
+    sampling of the next element.
+    The idea is that we don't want to carry a "cache" argument and output between all the forward calls
+    (since this is ugly). instead, a Module can inherit from the current class, which adds to the
+    module a state holding the cache. the cache can be easily disabled, reset, and multiple different
+    cache versions can be managed at the same time (each with a different key).
+    a Module which is a ModuleWithCache and has children modules which are also ModuleWithCache, needs
+    to explicitly call `register_modules_with_cache()` on them.
+    see usage example in `test.py`.
+    """
+
     def __init__(self):
         self.cache = dict()
         self._current_key = None
