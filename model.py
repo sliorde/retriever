@@ -271,6 +271,7 @@ class Attention(nn.Module, ModuleWithCache):
         self.d_x_kv = d_x_kv
         self.d_qk = d_qk
         self.d_v = d_v
+        self.d_out = d_out
         self.num_heads = num_heads
         self.offset = offset or 0
         self.causal = causal
@@ -356,7 +357,7 @@ class Attention(nn.Module, ModuleWithCache):
 
         q = torch.einsum('hdb,n...b->n...hd', self.to_q, x_q)  # [L, ..., H, D]
 
-        if x_kv is not None:
+        if have(x_kv):
             kv = torch.einsum('hdb,m...b->m...hd', self.to_kv, x_kv)  # [L', ..., H, D+D']
             k = kv[..., :self.d_qk]  # [L', ..., H, D]
             v = kv[..., self.d_qk:]  # [L', ..., H, D']
@@ -370,14 +371,17 @@ class Attention(nn.Module, ModuleWithCache):
             if have(kv_cache):
                 k_cache, v_cache = kv_cache
 
-                if k is None:
+                if dont_have(k):
                     k = k_cache.to(q.device)
                     v = v_cache.to(q.device)
                 else:
                     k = torch.cat((k_cache.to(k.device), k))
                     v = torch.cat((v_cache.to(v.device), v))
 
-            self.update_cache((k, v), 'kv')
+            if have(k):
+                self.update_cache((k, v), 'kv')
+            else:
+                self.update_cache(None, 'kv')
 
             if self.use_offset_cache:
                 offset_fix_cache = self.get_from_cache('offset_fix')
@@ -386,7 +390,8 @@ class Attention(nn.Module, ModuleWithCache):
                 offset_fix = offset_fix_cache
                 self.update_cache(offset_fix + len(q), 'offset_fix')
 
-        assert k is not None
+        if dont_have(k):
+            return torch.zeros(*x_q.shape[:-1], self.d_out, device=self.to_o.device, dtype=self.to_o.dtype)
 
         n, m = len(q), len(k)
 
@@ -432,7 +437,7 @@ class AttentionBlock(nn.Module, ModuleWithCache):
 
         x_q_normed = self.norm(x_q)
 
-        if x_kv is None:
+        if dont_have(x_kv):
             x_kv = x_q_normed
 
         return x_q + self.dropout(self.attention(x_q_normed, x_kv))  # [L, ..., D]
@@ -463,7 +468,7 @@ class ChunkedCrossAttentionBlock(nn.Module, ModuleWithCache):
 
     @staticmethod
     def get_stuff(pos, length, chunk_size):
-        num_elements_to_omit = max(0, chunk_size - 1 - pos)
+        num_elements_to_omit = min(max(0, chunk_size - 1 - pos), length)
         num_elements_to_keep = length - num_elements_to_omit
         len_x_q_padded = chunk_size * (((pos + length) // chunk_size) - (max(0, pos - (chunk_size - 1)) // chunk_size))
         # len_x_q_padded = ((num_elements_to_keep + chunk_size - 1) // chunk_size) * chunk_size
@@ -498,17 +503,19 @@ class ChunkedCrossAttentionBlock(nn.Module, ModuleWithCache):
             pos = pos_cached
         self.update_cache((pos + len(x_q)), 'pos')
 
-        if x_kv is None:
-            return x_q
+        # if dont_have(x_kv):
+        #     return x_q
 
         chunk_size = self.chunk_size
 
         len_x_q_padded, ind1_x_q, ind1_x_q_padded, \
         ind2_x_q_padded, ind1_z_padded, ind2_z_padded = self.get_stuff(pos, len(x_q), chunk_size)
 
-        x_q_padded = torch.zeros((len_x_q_padded, *x_q.shape[1:]), device=x_q.device)
+        x_q_padded = torch.zeros((len_x_q_padded, *x_q.shape[1:]), device=x_q.device, dtype=x_q.dtype)
         x_q_padded[ind1_x_q_padded:ind2_x_q_padded] = x_q[ind1_x_q:]
         x_q_chunked, _ = chunkenize(x_q_padded, chunk_size)  # [C, L//C, ..., D]
+        if dont_have(x_q_chunked):
+            return x_q
         z_chunked = self.attention(x_q_chunked, x_kv)  # [C, L//C , ..., D]
         if (pos + len(x_q) + 1) % chunk_size == 0:
             self.attention.update_cache(None, 'kv')
@@ -578,6 +585,11 @@ class Retriever(ModuleWithCache):
 
         seq_chunked, last_partial_chunk = chunkenize(seq, self.chunk_size)  # [C, L//C, ...]
 
+        rng = torch.Generator(device=seq.device).manual_seed(29847892371)
+        rng_state = self.get_from_cache('rng_state')
+        if have(rng_state):
+            rng.set_state(rng_state.to(rng.device))
+
         if dont_have(seq_chunked):  # in this case, the sequence was too short for even a single chunk
             retrieved = None
         else:
@@ -587,11 +599,12 @@ class Retriever(ModuleWithCache):
                  self.chunk_size + self.continuation_length, self.num_neighbors,
                  *seq_chunked.shape[2:]),
                 device=seq.device,
-                generator=torch.Generator(device=seq.device).manual_seed(29847892371)
+                generator=rng
             )  # [L//C, C', N, ...]
             retrieved = retrieved.movedim(0, 2)  # [C', N, L//C, ...]
 
         self.update_cache(last_partial_chunk, 'last_partial_chunk')
+        self.update_cache(rng.get_state(), 'rng_state')
 
         return retrieved
 
@@ -743,7 +756,7 @@ class RetroLanguageModel(nn.Module, ModuleWithCache):
             d_ff_enc,
             num_heads_enc,
             num_layers_enc,
-            ca_layers,
+            ca_layers_enc,
             chunk_size,
             continuation_length,
             num_neighbors,
@@ -760,7 +773,7 @@ class RetroLanguageModel(nn.Module, ModuleWithCache):
         self.embedding_enc = nn.Embedding(vocab_size, d_enc) if not share_embeddings \
             else partial(self.embedding_dec)
         self.encoder = Encoder(num_layers_enc, d_enc, d_ff_enc, d_dec, num_heads_enc,
-                               ca_layers, chunk_size, dropout)
+                               ca_layers_enc, chunk_size, dropout)
         encoder = partial(self.encoder)
         self.decoder = Decoder(num_layers_dec, d_dec, d_ff_dec, d_enc, num_heads_dec,
                                ca_start_dec, ca_freq_dec, chunk_size, encoder, dropout)
